@@ -2,20 +2,20 @@
  Transition from Photon based to ESP32 C6 based Home automation system. Developed together with Claude Sonnet in januari '26.
  Author: Fidel Dworp
 
- * Hardware:
- * - ESP32-C6 DevKit (16MB flash)
- * - MAX31865 PT1000 module (SPI) - Collector temperature
- * - 6× DS18B20 sensors (1-Wire) - Boiler stratification
- * - Relay module (230V pump control)
- * - PWM output (OEG pump speed control)
+ Hardware:
+ - ESP32-C6 DevKit (16MB flash)
+ - MAX31865 PT1000 module (SPI) - Collector temperature
+ - 6× DS18B20 sensors (1-Wire) - Boiler stratification
+ - Relay module (230V pump control)
+ - PWM output (OEG pump speed control)
 
  Version 1.0 (11 jan 2026)
- * - Initial ESP32-C6 version based on Photon S-ECO_SOLAR
- * - Web interface like HVAC V53.4
- * - Google Docs JSON logging
- * - In-memory graphing (60 samples)
- * - NVS configuration
- * - OTA updates
+ - Initial ESP32-C6 version based on Photon S-ECO_SOLAR
+ - Web interface like HVAC V53.4
+ - Google Docs JSON logging
+ - In-memory graphing (60 samples)
+ - NVS configuration
+ - OTA updates
   
  */
 
@@ -54,7 +54,6 @@
 #define PWM_PIN    4   // OEG pump PWM speed control (0-255)
 
 // PWM configuration
-#define PWM_CHANNEL 0
 #define PWM_FREQ    1000  // 1kHz
 #define PWM_RESOLUTION 8  // 8-bit (0-255)
 
@@ -481,10 +480,9 @@ void setupPump() {
   digitalWrite(RELAY_PIN, HIGH);  // OFF (active LOW)
   pump_relay = false;
   
-  // PWM
-  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PWM_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0);
+  // PWM (ESP32 core 3.x API)
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(PWM_PIN, 0);
   pwm_value = 0;
   
   Serial.println("Pump control initialized (Relay + PWM)");
@@ -848,7 +846,7 @@ void controlPump(bool state, int pwm) {
   digitalWrite(RELAY_PIN, state ? LOW : HIGH);
   
   // PWM
-  ledcWrite(PWM_CHANNEL, state ? pwm : 0);
+  ledcWrite(PWM_PIN, state ? pwm : 0);
 }
 
 // ============================================================================
