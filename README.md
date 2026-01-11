@@ -1,4 +1,10 @@
-# ESP32C6_ECO-boiler
+# ECO-Boiler Controller
+
+**Intelligente zonne- en haardenergie controller voor optimale benutting van gratis warmte**
+
+---
+
+Historiek:
 
 Onze zonneboiler op het dak oogst zonne energie tijdens zonnige dagen en haard-energie in de winterse periode. (Zowel onze zoon als wij hebben een zelfde type haard van JIDE, die een deel van de warmte naar de boiler sturen met hun eigen pomp en sensoren.)
 
@@ -17,6 +23,7 @@ Dus maakte ik een box met een Photon shield en deze peripherals:
 - Een bordje om de PT1000 sensor op het dak te lezen en aan de Photon door te geven.
 - Een 5V pomprelais, aangesloten op de Photon.
 - Een PWM signaal van de Photon, aangesloten op de OEG pomp.
+- 6 temperatuur sensors in de ECO boiler om de warmte inhoud en verdeling op te volgen.
 
 Deze controller heeft tot nu toe reeds 5 jaar goeie dienst bewezen, maar een groot nadeel is de wifi stabiliteit van de Photon. De controller verliest te dikwijls "de pedalen" zodat de zonneboiler soms niet meer doorpompt wordt...
 
@@ -25,13 +32,6 @@ Dit deed me besluiten om ook dit systeem om te vormen tot een ESP32C6 controller
 FiDel, Recht 11jan26
 
 ----------------------------
-
-# ESP32C6 ECO-Boiler Controller
-
-**Intelligente zonne- en haardenergie controller voor optimale benutting van gratis warmte**
-
----
-
 ## 📋 Inhoudsopgave
 
 1. [High-Level Overzicht](#high-level-overzicht) *(Voor nieuwkomers)*
