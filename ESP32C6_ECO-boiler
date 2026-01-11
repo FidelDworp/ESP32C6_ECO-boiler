@@ -1,9 +1,1266 @@
-/* ESP32C6_ECO-boiler.ino = Zonnecollector + Haarden boiler controller voor op verdieping in de woning.
-Transition from Photon based to ESP32 C6 based Home automation system. Developed together with Claude Sonnet in januari '26.
+/* ESP32_ECO_V1.0.ino - Solar & Fireplace Energy Controller
+ Transition from Photon based to ESP32 C6 based Home automation system. Developed together with Claude Sonnet in januari '26.
+ Author: Fidel Dworp
 
+ * Hardware:
+ * - ESP32-C6 DevKit (16MB flash)
+ * - MAX31865 PT1000 module (SPI) - Collector temperature
+ * - 6× DS18B20 sensors (1-Wire) - Boiler stratification
+ * - Relay module (230V pump control)
+ * - PWM output (OEG pump speed control)
 
-To do Later:
--
-*/
+ Version 1.0 (11 jan 2026)
+ * - Initial ESP32-C6 version based on Photon S-ECO_SOLAR
+ * - Web interface like HVAC V53.4
+ * - Google Docs JSON logging
+ * - In-memory graphing (60 samples)
+ * - NVS configuration
+ * - OTA updates
+  
+ */
 
+// ============== INCLUDES ==============
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <time.h>
 
+// SPI for MAX31865
+#include <SPI.h>
+#include <Adafruit_MAX31865.h>
+
+// 1-Wire for DS18B20 (ESP32-C6 compatible!)
+#include <OneWireNg_CurrentPlatform.h>
+
+// ============== PIN DEFINITIONS ==============
+// SIMULATION MODE - Set to true for testing without sensors
+#define SIMULATION_MODE false  // Set to true for testing on breadboard
+
+// SPI pins (MAX31865 PT1000)
+#define SPI_CS    10  // Chip Select
+#define SPI_MOSI  11  // MOSI
+#define SPI_MISO  12  // MISO
+#define SPI_SCK   13  // Clock
+
+// 1-Wire pin (DS18B20 boiler sensors)
+#define ONEWIRE_PIN  3
+
+// Pump control
+#define RELAY_PIN  2   // 230V pump relay (active LOW)
+#define PWM_PIN    4   // OEG pump PWM speed control (0-255)
+
+// PWM configuration
+#define PWM_CHANNEL 0
+#define PWM_FREQ    1000  // 1kHz
+#define PWM_RESOLUTION 8  // 8-bit (0-255)
+
+// ============== CONSTANTS ==============
+// Pump control thresholds (configurable via NVS)
+float DT_START_THRESHOLD = 3.0;      // °C - Start pump
+float DT_STOP_THRESHOLD = 2.0;       // °C - Stop pump (hysteresis)
+float TSUN_MIN_TEMP = 22.0;          // °C - Thermosiphon prevention
+float TSUN_OVERHEAT = 90.0;          // °C - Overheat protection
+float TSUN_HIGH = 75.0;              // °C - High temp threshold
+int MAX_LOSS_STREAK = 3;            // Number of consecutive losses
+int PWM_MIN = 80;                    // Minimum pump speed
+int PWM_MAX = 200;                   // Maximum regular speed
+int PWM_OVERHEAT = 255;              // Overheat speed
+
+// Energy calculation (configurable)
+float ETMIN = 35.0;                  // °C - Minimum temp for Qtot
+float GLYCOL_PERCENT = 0.0;          // % glycol in system (0-50)
+float BOILER_VOLUME_TOTAL = 490.0;   // Liters total
+
+// Volume distribution (5 zones)
+float ZONE_VOLUMES[5] = {110.0, 90.0, 90.0, 90.0, 110.0}; // Liters per zone
+
+// Timing intervals
+const unsigned long SENSOR_INTERVAL = 60000;      // 60s - Read sensors
+const unsigned long PUMP_CHECK_INTERVAL = 60000;  // 60s - Check pump logic
+const unsigned long DEQ_INTERVAL = 600000;        // 10 min - Calculate dEQ
+const unsigned long HVAC_PUBLISH_INTERVAL = 300000; // 5 min - HVAC update
+
+// PT1000 calibration
+const float RREF = 4000.0;    // Reference resistance (Chinese modules)
+const float RNOMINAL = 1000.0; // PT1000 @ 0°C
+
+// Operating hours
+const int HOUR_START = 7;     // Start hour (morning)
+const int HOUR_END = 21;      // End hour (evening)
+
+// HVAC integration threshold
+float HVAC_TRANSFER_THRESHOLD = 15.0;  // kWh - Trigger HVAC transfer
+
+// ============== GLOBAL OBJECTS ==============
+Preferences preferences;
+AsyncWebServer server(80);
+DNSServer dnsServer;
+
+// Sensors
+Adafruit_MAX31865 pt1000 = Adafruit_MAX31865(SPI_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
+OneWireNg_CurrentPlatform ow(ONEWIRE_PIN, false);
+
+// ============== CONFIGURATION STRUCTURE ==============
+struct Config {
+  char room_id[32];
+  char wifi_ssid[64];
+  char wifi_pass[64];
+  char static_ip[16];
+  char hvac_ip[16];
+  char hvac_mdns[32];
+  bool hvac_enabled;
+  
+  // Loaded values (from defines above)
+  float dt_start;
+  float dt_stop;
+  float tsun_min;
+  float tsun_overheat;
+  float tsun_high;
+  int max_loss_streak;
+  int pwm_min;
+  int pwm_max;
+  int pwm_overheat;
+  float etmin;
+  float glycol_percent;
+  float boiler_volume;
+  float hvac_threshold;
+} config;
+
+// ============== SENSOR DATA ==============
+// DS18B20 addresses (from Photon sketch) - OneWireNg format for ESP32-C6!
+OneWireNg::Id boilerSensors[6] = {
+  {0x28,0xFF,0x0D,0x4C,0x05,0x16,0x03,0xC7}, // ETopH
+  {0x28,0xFF,0x25,0x1A,0x01,0x16,0x04,0xCD}, // ETopL
+  {0x28,0xFF,0x89,0x19,0x01,0x16,0x04,0x57}, // EMidH
+  {0x28,0xFF,0x21,0x9F,0x61,0x15,0x03,0xF9}, // EMidL
+  {0x28,0xFF,0x16,0x6B,0x00,0x16,0x03,0x08}, // EBotH
+  {0x28,0xFF,0x90,0xA2,0x00,0x16,0x04,0x76}  // EBotL
+};
+
+// Temperature storage
+float ETopH = 0, ETopL = 0, EMidH = 0, EMidL = 0, EBotH = 0, EBotL = 0;
+float EAv = 0;      // Average boiler temp
+float Tsun = 0;     // Collector temp (PT1000)
+float Tboil = 0;    // Boiler input temp (EBotH)
+float dT = 0;       // Temperature differential
+
+// Energy
+float EQtot = 0;    // Total available energy (kWh)
+float dEQ = 0;      // Energy change over 10 min (kWh)
+float prev_EQtot = 0;
+
+// Pump state
+bool pump_relay = false;       // Relay state
+int pwm_value = 0;             // PWM value (0-255)
+String pump_status = "IDLE";   // Status message
+int consecutive_reductions = 0; // Loss streak counter
+
+// Timing
+unsigned long last_sensor_read = 0;
+unsigned long last_pump_check = 0;
+unsigned long last_deq_calc = 0;
+unsigned long last_hvac_publish = 0;
+unsigned long uptime_sec = 0;
+unsigned long last_uptime_update = 0;
+
+// WiFi
+bool ap_mode = false;
+int wifi_rssi = 0;
+
+// Statistics (daily reset at midnight)
+float yield_today = 0;
+int pump_minutes_today = 0;
+int pump_starts_today = 0;
+unsigned long pump_on_start = 0;
+
+// ============== IN-MEMORY GRAPHING ==============
+#define GRAPH_SAMPLES 60  // 60 samples = 60 minutes @ 1/min
+
+struct GraphData {
+  float tsun[GRAPH_SAMPLES];
+  float tboil[GRAPH_SAMPLES];
+  float dt[GRAPH_SAMPLES];
+  float eqtot[GRAPH_SAMPLES];
+  float deq[GRAPH_SAMPLES];
+  int pwm[GRAPH_SAMPLES];
+  int index;  // Current write position (circular buffer)
+} graph_data;
+
+// ============== NVS KEYS ==============
+#define NVS_NAMESPACE "eco-config"
+#define NVS_ROOM_ID "room_id"
+#define NVS_WIFI_SSID "wifi_ssid"
+#define NVS_WIFI_PASS "wifi_pass"
+#define NVS_STATIC_IP "static_ip"
+#define NVS_HVAC_IP "hvac_ip"
+#define NVS_HVAC_MDNS "hvac_mdns"
+#define NVS_HVAC_ENABLED "hvac_enabled"
+#define NVS_DT_START "dt_start"
+#define NVS_DT_STOP "dt_stop"
+#define NVS_TSUN_MIN "tsun_min"
+#define NVS_ETMIN "etmin"
+#define NVS_GLYCOL_PCT "glycol_pct"
+#define NVS_HVAC_THRESH "hvac_thresh"
+
+// ============== FUNCTION DECLARATIONS ==============
+void loadConfig();
+void saveConfig();
+void factoryReset();
+void setupWiFi();
+void setupSensors();
+void setupPump();
+void setupWebServer();
+void readSensors();
+void calculateEnergy();
+void checkPumpLogic();
+void controlPump(bool state, int pwm);
+void publishHVAC();
+void addGraphSample();
+String getMainPage();
+String getSettingsPage();
+String getManualPage();
+String getGraphDataJSON();
+float readPT1000();
+float calculatePWM(float dT, float Tsun);
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n=== ESP32 ECO Controller V1.0 ===");
+  Serial.println("Based on: HVAC V53.4 + Photon ECO logic");
+  Serial.println("Features: Web UI, Google Docs JSON, In-memory graphs");
+  
+  // Check for factory reset (type 'R' within 3s)
+  Serial.println("\nFactory reset? Type 'R' within 3 seconds...");
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (Serial.available() && Serial.read() == 'R') {
+      factoryReset();
+      break;
+    }
+  }
+  
+  // Load configuration
+  loadConfig();
+  
+  // Initialize hardware
+  setupPump();
+  setupSensors();
+  
+  // Initialize graph data
+  memset(&graph_data, 0, sizeof(graph_data));
+  
+  // Setup WiFi & Web Server
+  setupWiFi();
+  setupWebServer();
+  
+  // NTP time sync
+  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
+  tzset();
+  
+  Serial.println("\n=== Setup Complete ===");
+  Serial.println("Ready!");
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+  // Handle DNS (if in AP mode)
+  if (ap_mode) {
+    dnsServer.processNextRequest();
+  }
+  
+  // Update uptime
+  if (millis() - last_uptime_update >= 1000) {
+    uptime_sec++;
+    last_uptime_update = millis();
+  }
+  
+  // Read sensors (every 60s)
+  if (millis() - last_sensor_read >= SENSOR_INTERVAL) {
+    readSensors();
+    calculateEnergy();
+    addGraphSample();
+    last_sensor_read = millis();
+  }
+  
+  // Calculate dEQ (every 10 min)
+  if (millis() - last_deq_calc >= DEQ_INTERVAL) {
+    dEQ = EQtot - prev_EQtot;
+    prev_EQtot = EQtot;
+    last_deq_calc = millis();
+    
+    Serial.printf("dEQ: %.3f kWh/10min\n", dEQ);
+  }
+  
+  // Check pump logic (every 60s)
+  if (millis() - last_pump_check >= PUMP_CHECK_INTERVAL) {
+    checkPumpLogic();
+    last_pump_check = millis();
+  }
+  
+  // Publish to HVAC (every 5 min, if enabled and threshold met)
+  if (config.hvac_enabled && EQtot > config.hvac_threshold) {
+    if (millis() - last_hvac_publish >= HVAC_PUBLISH_INTERVAL) {
+      publishHVAC();
+      last_hvac_publish = millis();
+    }
+  }
+  
+  // Track pump runtime
+  if (pump_relay) {
+    // Pump is running
+  }
+  
+  // Reset daily stats at midnight
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0 && timeinfo.tm_sec < 2) {
+    yield_today = 0;
+    pump_minutes_today = 0;
+    pump_starts_today = 0;
+  }
+  
+  // Serial test commands (for debugging)
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    switch(cmd) {
+      case 't': // Test sensors
+        Serial.println("\n*** SENSOR TEST ***");
+        readSensors();
+        calculateEnergy();
+        Serial.println("Done!");
+        break;
+        
+      case 'p': // Test pump
+        Serial.println("\n*** PUMP TEST ***");
+        Serial.println("Pump ON (PWM 150)...");
+        controlPump(true, 150);
+        delay(3000);
+        Serial.println("Pump OFF...");
+        controlPump(false, 0);
+        Serial.println("Done!");
+        break;
+        
+      case 'w': // WiFi status
+        Serial.println("\n*** WiFi STATUS ***");
+        Serial.printf("Mode: %s\n", ap_mode ? "AP" : "STA");
+        if (!ap_mode) {
+          Serial.printf("SSID: %s\n", config.wifi_ssid);
+          Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+          Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+        } else {
+          Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+        }
+        break;
+        
+      case 'e': // Energy status
+        Serial.println("\n*** ENERGY STATUS ***");
+        Serial.printf("EQtot: %.2f kWh\n", EQtot);
+        Serial.printf("dEQ: %.3f kWh/10min\n", dEQ);
+        Serial.printf("Yield today: %.1f kWh\n", yield_today);
+        break;
+        
+      case 'h': // Help
+        Serial.println("\n*** SERIAL COMMANDS ***");
+        Serial.println("t - Test sensors");
+        Serial.println("p - Test pump");
+        Serial.println("w - WiFi status");
+        Serial.println("e - Energy status");
+        Serial.println("h - This help");
+        break;
+    }
+  }
+  
+  delay(100);
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+void loadConfig() {
+  preferences.begin(NVS_NAMESPACE, false);
+  
+  // System
+  String temp = preferences.getString(NVS_ROOM_ID, "ECO");
+  strncpy(config.room_id, temp.c_str(), sizeof(config.room_id) - 1);
+  
+  // WiFi
+  temp = preferences.getString(NVS_WIFI_SSID, "");
+  strncpy(config.wifi_ssid, temp.c_str(), sizeof(config.wifi_ssid) - 1);
+  
+  temp = preferences.getString(NVS_WIFI_PASS, "");
+  strncpy(config.wifi_pass, temp.c_str(), sizeof(config.wifi_pass) - 1);
+  
+  temp = preferences.getString(NVS_STATIC_IP, "");
+  strncpy(config.static_ip, temp.c_str(), sizeof(config.static_ip) - 1);
+  
+  // HVAC integration
+  temp = preferences.getString(NVS_HVAC_IP, "");
+  strncpy(config.hvac_ip, temp.c_str(), sizeof(config.hvac_ip) - 1);
+  
+  temp = preferences.getString(NVS_HVAC_MDNS, "hvac");
+  strncpy(config.hvac_mdns, temp.c_str(), sizeof(config.hvac_mdns) - 1);
+  
+  config.hvac_enabled = preferences.getBool(NVS_HVAC_ENABLED, true);
+  
+  // Thresholds
+  config.dt_start = preferences.getFloat(NVS_DT_START, DT_START_THRESHOLD);
+  config.dt_stop = preferences.getFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
+  config.tsun_min = preferences.getFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
+  config.etmin = preferences.getFloat(NVS_ETMIN, ETMIN);
+  config.glycol_percent = preferences.getFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
+  config.hvac_threshold = preferences.getFloat(NVS_HVAC_THRESH, HVAC_TRANSFER_THRESHOLD);
+  
+  // Copy to globals (for easy access)
+  DT_START_THRESHOLD = config.dt_start;
+  DT_STOP_THRESHOLD = config.dt_stop;
+  TSUN_MIN_TEMP = config.tsun_min;
+  ETMIN = config.etmin;
+  GLYCOL_PERCENT = config.glycol_percent;
+  HVAC_TRANSFER_THRESHOLD = config.hvac_threshold;
+  
+  preferences.end();
+  
+  Serial.println("Configuration loaded from NVS");
+  Serial.printf("Room ID: %s\n", config.room_id);
+  Serial.printf("WiFi SSID: %s\n", strlen(config.wifi_ssid) > 0 ? config.wifi_ssid : "(not configured)");
+  Serial.printf("HVAC: %s\n", config.hvac_enabled ? "Enabled" : "Disabled");
+}
+
+void saveConfig() {
+  preferences.begin(NVS_NAMESPACE, false);
+  
+  preferences.putString(NVS_ROOM_ID, config.room_id);
+  preferences.putString(NVS_WIFI_SSID, config.wifi_ssid);
+  preferences.putString(NVS_WIFI_PASS, config.wifi_pass);
+  preferences.putString(NVS_STATIC_IP, config.static_ip);
+  preferences.putString(NVS_HVAC_IP, config.hvac_ip);
+  preferences.putString(NVS_HVAC_MDNS, config.hvac_mdns);
+  preferences.putBool(NVS_HVAC_ENABLED, config.hvac_enabled);
+  preferences.putFloat(NVS_DT_START, config.dt_start);
+  preferences.putFloat(NVS_DT_STOP, config.dt_stop);
+  preferences.putFloat(NVS_TSUN_MIN, config.tsun_min);
+  preferences.putFloat(NVS_ETMIN, config.etmin);
+  preferences.putFloat(NVS_GLYCOL_PCT, config.glycol_percent);
+  preferences.putFloat(NVS_HVAC_THRESH, config.hvac_threshold);
+  
+  preferences.end();
+  
+  Serial.println("Configuration saved to NVS");
+}
+
+void factoryReset() {
+  Serial.println("\n*** FACTORY RESET ***");
+  preferences.begin(NVS_NAMESPACE, false);
+  preferences.clear();
+  preferences.end();
+  Serial.println("NVS cleared. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+// ============================================================================
+// HARDWARE SETUP
+// ============================================================================
+void setupPump() {
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // OFF (active LOW)
+  pump_relay = false;
+  
+  // PWM
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(PWM_PIN, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, 0);
+  pwm_value = 0;
+  
+  Serial.println("Pump control initialized (Relay + PWM)");
+}
+
+void setupSensors() {
+  // PT1000 (MAX31865)
+  pt1000.begin(MAX31865_2WIRE);
+  Serial.println("PT1000 sensor initialized (MAX31865 SPI)");
+  
+  // DS18B20 (1-Wire) - OneWireNg doesn't need explicit init
+  // Just verify we can detect sensors
+  Serial.println("DS18B20 sensors ready (OneWireNg - ESP32-C6 compatible)");
+  Serial.println("Expected: 6 sensors");
+}
+
+// ============================================================================
+// WIFI SETUP
+// ============================================================================
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(config.room_id);
+  
+  // Try to connect if credentials available
+  if (strlen(config.wifi_ssid) > 0) {
+    Serial.printf("Connecting to '%s'...\n", config.wifi_ssid);
+    
+    // Static IP if configured
+    if (strlen(config.static_ip) > 0) {
+      IPAddress ip, gateway(192, 168, 1, 1), subnet(255, 255, 255, 0);
+      if (ip.fromString(config.static_ip)) {
+        WiFi.config(ip, gateway, subnet);
+      }
+    }
+    
+    WiFi.begin(config.wifi_ssid, config.wifi_pass);
+    
+    // Wait up to 20s
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("✓ WiFi connected!");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+      
+      // mDNS
+      if (MDNS.begin(config.room_id)) {
+        Serial.printf("mDNS: http://%s.local\n", config.room_id);
+      }
+      
+      ap_mode = false;
+      return;
+    }
+  }
+  
+  // Fallback to AP mode
+  Serial.println("✗ WiFi connection failed");
+  Serial.println("Starting AP mode...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ECO-Setup");
+  
+  IPAddress ap_ip = WiFi.softAPIP();
+  Serial.printf("AP IP: %s\n", ap_ip.toString().c_str());
+  
+  // Captive portal DNS
+  dnsServer.start(53, "*", ap_ip);
+  
+  ap_mode = true;
+}
+
+// ============================================================================
+// SENSOR READING
+// ============================================================================
+float readPT1000() {
+  // Read PT1000 via MAX31865 (manual calculation to avoid freeze bug)
+  uint16_t rtd = pt1000.readRTD();
+  
+  if (rtd == 0 || rtd > 32768) {
+    Serial.println("PT1000 read error");
+    return -127.0;
+  }
+  
+  float ratio = rtd / 32768.0;
+  float resistance = ratio * RREF;
+  float temperature = (resistance - RNOMINAL) / 3.850;  // Linear approximation
+  
+  if (temperature < -50 || temperature > 200 || isnan(temperature)) {
+    Serial.println("PT1000 temperature out of range");
+    return -127.0;
+  }
+  
+  return temperature;
+}
+
+void readSensors() {
+  Serial.println("\n=== Reading Sensors ===");
+  
+  #if SIMULATION_MODE
+    // SIMULATION MODE - Generate realistic fake data for testing
+    Serial.println("⚠️ SIMULATION MODE - Using fake data!");
+    
+    // Simulate realistic solar collector behavior
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    int hour = timeinfo.tm_hour;
+    
+    // Collector temp based on time of day
+    if (hour >= 8 && hour <= 17) {
+      // Daytime - sunny simulation
+      float sun_factor = sin((hour - 8) * 3.14159 / 9.0);  // Peak at 13:00
+      Tsun = 25.0 + sun_factor * 40.0 + random(-20, 20) / 10.0;  // 25-65°C
+    } else {
+      // Night - cool down
+      Tsun = 15.0 + random(-30, 30) / 10.0;  // 12-18°C
+    }
+    
+    // Boiler temps - stratified (hotter at top)
+    ETopH = 60.0 + random(-20, 20) / 10.0;
+    ETopL = 58.0 + random(-20, 20) / 10.0;
+    EMidH = 50.0 + random(-20, 20) / 10.0;
+    EMidL = 48.0 + random(-20, 20) / 10.0;
+    EBotH = 40.0 + random(-20, 20) / 10.0;
+    EBotL = 38.0 + random(-20, 20) / 10.0;
+    
+    Serial.printf("Tsun (FAKE): %.1f°C\n", Tsun);
+    Serial.printf("Boiler (FAKE): TopH=%.1f TopL=%.1f MidH=%.1f MidL=%.1f BotH=%.1f BotL=%.1f\n",
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL);
+    
+  #else
+    // REAL MODE - Read actual sensors
+    
+    // PT1000 (collector)
+    Tsun = readPT1000();
+    Serial.printf("Tsun (Collector): %.1f°C\n", Tsun);
+    
+    // DS18B20 (boiler) - Manual reading with OneWireNg (ESP32-C6 compatible!)
+    // This is the SAME method as HVAC V53.4
+    float temps[6];
+    
+    for (int i = 0; i < 6; i++) {
+      // Start conversion
+      ow.reset();
+      ow.writeByte(0x55);  // Match ROM
+      for (int j = 0; j < 8; j++) ow.writeByte(boilerSensors[i][j]);
+      ow.writeByte(0x44);  // Convert T
+      delay(750);  // Wait for conversion
+      
+      // Read scratchpad
+      ow.reset();
+      ow.writeByte(0x55);  // Match ROM
+      for (int j = 0; j < 8; j++) ow.writeByte(boilerSensors[i][j]);
+      ow.writeByte(0xBE);  // Read scratchpad
+      
+      uint8_t data[9];
+      for (int j = 0; j < 9; j++) data[j] = ow.readByte();
+      
+      // CRC check (same algorithm as HVAC)
+      uint8_t crc = 0;
+      for (int j = 0; j < 8; j++) {
+        uint8_t inbyte = data[j];
+        for (int k = 0; k < 8; k++) {
+          uint8_t mix = (crc ^ inbyte) & 0x01;
+          crc >>= 1;
+          if (mix) crc ^= 0x8C;
+          inbyte >>= 1;
+        }
+      }
+      
+      // Validate CRC and convert
+      if (crc == data[8]) {
+        int16_t raw = (data[1] << 8) | data[0];
+        temps[i] = raw / 16.0;
+      } else {
+        temps[i] = -127.0;
+        Serial.printf("WARNING: CRC error on sensor %d\n", i);
+      }
+    }
+    
+    // Assign to global variables
+    ETopH = temps[0];
+    ETopL = temps[1];
+    EMidH = temps[2];
+    EMidL = temps[3];
+    EBotH = temps[4];
+    EBotL = temps[5];
+    
+    Serial.printf("Boiler: TopH=%.1f TopL=%.1f MidH=%.1f MidL=%.1f BotH=%.1f BotL=%.1f\n",
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL);
+  #endif
+  
+  // Calculate averages (same for both modes)
+  float EAv1 = (ETopH + ETopL) / 2.0;
+  float EAv2 = (ETopL + EMidH) / 2.0;
+  float EAv3 = (EMidH + EMidL) / 2.0;
+  float EAv4 = (EMidL + EBotH) / 2.0;
+  float EAv5 = (EBotH + EBotL) / 2.0;
+  EAv = (EAv1 + EAv2 + EAv3 + EAv4 + EAv5) / 5.0;
+  
+  Serial.printf("EAv: %.1f°C\n", EAv);
+  
+  // Calculate dT
+  Tboil = EBotH;  // Boiler input temperature
+  dT = Tsun - Tboil;
+  Serial.printf("dT: %.1f°C (Tsun - Tboil)\n", dT);
+  
+  // WiFi RSSI
+  if (!ap_mode) {
+    wifi_rssi = WiFi.RSSI();
+  }
+}
+
+void calculateEnergy() {
+  // Calculate energy per zone
+  // Specific heat: Water = 1.163 Wh/L·K, Glycol ~0.9
+  // Adjust for glycol percentage
+  float specific_heat = 1.163 * (1.0 - GLYCOL_PERCENT / 100.0 * 0.23);
+  
+  float EAv1 = (ETopH + ETopL) / 2.0;
+  float EAv2 = (ETopL + EMidH) / 2.0;
+  float EAv3 = (EMidH + EMidL) / 2.0;
+  float EAv4 = (EMidL + EBotH) / 2.0;
+  float EAv5 = (EBotH + EBotL) / 2.0;
+  
+  float EQ1 = (EAv1 - ETMIN) * ZONE_VOLUMES[0] * specific_heat / 1000.0;
+  float EQ2 = (EAv2 - ETMIN) * ZONE_VOLUMES[1] * specific_heat / 1000.0;
+  float EQ3 = (EAv3 - ETMIN) * ZONE_VOLUMES[2] * specific_heat / 1000.0;
+  float EQ4 = (EAv4 - ETMIN) * ZONE_VOLUMES[3] * specific_heat / 1000.0;
+  float EQ5 = (EAv5 - ETMIN) * ZONE_VOLUMES[4] * specific_heat / 1000.0;
+  
+  // Clamp negative values to zero
+  if (EQ1 < 0) EQ1 = 0;
+  if (EQ2 < 0) EQ2 = 0;
+  if (EQ3 < 0) EQ3 = 0;
+  if (EQ4 < 0) EQ4 = 0;
+  if (EQ5 < 0) EQ5 = 0;
+  
+  EQtot = EQ1 + EQ2 + EQ3 + EQ4 + EQ5;
+  
+  Serial.printf("EQtot: %.2f kWh (zones: %.2f, %.2f, %.2f, %.2f, %.2f)\n", 
+    EQtot, EQ1, EQ2, EQ3, EQ4, EQ5);
+}
+
+// ============================================================================
+// PUMP CONTROL LOGIC
+// ============================================================================
+void checkPumpLogic() {
+  Serial.println("\n=== Pump Logic Check ===");
+  
+  // Get current hour
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  int hour = timeinfo.tm_hour;
+  
+  bool should_run = true;
+  String reason = "OK";
+  
+  // CHECK 1: Night blocking
+  if (hour < HOUR_START || hour >= HOUR_END) {
+    should_run = false;
+    reason = "Night blocking (" + String(hour) + ":00)";
+  }
+  
+  // CHECK 2: dT threshold (with hysteresis)
+  else if (!pump_relay && dT < DT_START_THRESHOLD) {
+    should_run = false;
+    reason = "dT too low (" + String(dT, 1) + "°C < " + String(DT_START_THRESHOLD, 1) + "°C)";
+  }
+  else if (pump_relay && dT < DT_STOP_THRESHOLD) {
+    should_run = false;
+    reason = "dT below stop threshold (" + String(dT, 1) + "°C < " + String(DT_STOP_THRESHOLD, 1) + "°C)";
+  }
+  
+  // CHECK 3: Thermosiphon prevention
+  else if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) {
+    should_run = false;
+    reason = "Thermosiphon risk (Tsun=" + String(Tsun, 1) + "°C < " + String(TSUN_MIN_TEMP, 1) + "°C)";
+  }
+  
+  // CHECK 4: Loss streak
+  else if (should_run && consecutive_reductions >= MAX_LOSS_STREAK) {
+    should_run = false;
+    reason = "Loss streak (" + String(consecutive_reductions) + "× consecutive losses)";
+  }
+  
+  // CHECK 5: Overheat protection (overrides everything!)
+  if (Tsun >= TSUN_OVERHEAT) {
+    should_run = true;
+    reason = "OVERHEAT PROTECTION (Tsun=" + String(Tsun, 1) + "°C >= " + String(TSUN_OVERHEAT, 1) + "°C)";
+  }
+  
+  // Update loss streak
+  if (dEQ > 0) {
+    consecutive_reductions = 0;  // Reset on energy gain
+  } else if (dEQ <= 0 && pump_relay) {
+    consecutive_reductions++;    // Increment on loss while pumping
+  }
+  
+  // Calculate PWM
+  int target_pwm = 0;
+  if (should_run) {
+    target_pwm = calculatePWM(dT, Tsun);
+  }
+  
+  // Apply pump state
+  if (should_run != pump_relay) {
+    // State change
+    if (should_run) {
+      pump_starts_today++;
+      pump_on_start = millis();
+    } else {
+      // Calculate pump minutes
+      if (pump_on_start > 0) {
+        pump_minutes_today += (millis() - pump_on_start) / 60000;
+      }
+    }
+  }
+  
+  controlPump(should_run, target_pwm);
+  pump_status = reason;
+  
+  Serial.printf("Pump: %s (PWM %d/255)\n", should_run ? "ON" : "OFF", target_pwm);
+  Serial.printf("Reason: %s\n", reason.c_str());
+  Serial.printf("Loss streak: %d/%d\n", consecutive_reductions, MAX_LOSS_STREAK);
+}
+
+float calculatePWM(float dT, float Tsun) {
+  // Overheat protection
+  if (Tsun >= TSUN_OVERHEAT) {
+    return PWM_OVERHEAT;
+  }
+  
+  // High temperature (fixed speed)
+  if (Tsun > TSUN_HIGH) {
+    return 180;  // Fixed high speed
+  }
+  
+  // Normal operation (linear mapping)
+  // dT 3-20°C → PWM 80-200
+  float delta = constrain(dT - DT_START_THRESHOLD, 0.0, 17.0);
+  float pwm = PWM_MIN + (delta * (PWM_MAX - PWM_MIN) / 17.0);
+  
+  return (int)pwm;
+}
+
+void controlPump(bool state, int pwm) {
+  pump_relay = state;
+  pwm_value = pwm;
+  
+  // Relay (active LOW)
+  digitalWrite(RELAY_PIN, state ? LOW : HIGH);
+  
+  // PWM
+  ledcWrite(PWM_CHANNEL, state ? pwm : 0);
+}
+
+// ============================================================================
+// HVAC INTEGRATION
+// ============================================================================
+void publishHVAC() {
+  if (!config.hvac_enabled) return;
+  if (ap_mode) return;  // Can't publish in AP mode
+  
+  Serial.println("\n=== Publishing to HVAC ===");
+  Serial.printf("EQtot: %.2f kWh (threshold: %.2f kWh)\n", EQtot, config.hvac_threshold);
+  
+  // Try IP first, then mDNS
+  String url = "";
+  if (strlen(config.hvac_ip) > 0) {
+    url = "http://" + String(config.hvac_ip) + "/eco_energy";
+  } else if (strlen(config.hvac_mdns) > 0) {
+    url = "http://" + String(config.hvac_mdns) + ".local/eco_energy";
+  } else {
+    Serial.println("No HVAC target configured");
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  String payload = "eqtot=" + String(EQtot, 2);
+  int httpCode = http.POST(payload);
+  
+  if (httpCode > 0) {
+    Serial.printf("HVAC response: %d\n", httpCode);
+    if (httpCode == 200) {
+      Serial.println("✓ HVAC received energy data");
+    }
+  } else {
+    Serial.printf("HVAC publish failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+// ============================================================================
+// GRAPHING
+// ============================================================================
+void addGraphSample() {
+  // Add current values to circular buffer
+  graph_data.tsun[graph_data.index] = Tsun;
+  graph_data.tboil[graph_data.index] = Tboil;
+  graph_data.dt[graph_data.index] = dT;
+  graph_data.eqtot[graph_data.index] = EQtot;
+  graph_data.deq[graph_data.index] = dEQ;
+  graph_data.pwm[graph_data.index] = pwm_value;
+  
+  graph_data.index = (graph_data.index + 1) % GRAPH_SAMPLES;
+}
+
+String getGraphDataJSON() {
+  String json = "{";
+  
+  // Tsun array
+  json += "\"tsun\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.tsun[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // Tboil array
+  json += "\"tboil\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.tboil[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // dT array
+  json += "\"dt\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.dt[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // EQtot array
+  json += "\"eqtot\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.eqtot[idx], 2);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // PWM array
+  json += "\"pwm\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.pwm[idx]);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "]";
+  
+  json += "}";
+  return json;
+}
+
+// ============================================================================
+// WEB SERVER SETUP
+// ============================================================================
+void setupWebServer() {
+  // Main page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", getMainPage());
+  });
+  
+  // Settings page
+  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Captive portal redirect in AP mode
+    if (ap_mode && request->host() != WiFi.softAPIP().toString()) {
+      request->redirect("http://" + WiFi.softAPIP().toString() + "/settings");
+      return;
+    }
+    request->send(200, "text/html", getSettingsPage());
+  });
+  
+  // Manual control page
+  server.on("/manual", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", getManualPage());
+  });
+  
+  // JSON endpoint (Google Docs compatible - Photon format with uptime first)
+  server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Exact Photon format maar met uptime vooraan (zoals HVAC)
+    char json[400];
+    snprintf(json, sizeof(json), 
+      "{\"uptime\":%lu,"
+      "\"ETopH\":%.1f,\"ETopL\":%.1f,\"EMidH\":%.1f,\"EMidL\":%.1f,"
+      "\"EBotH\":%.1f,\"EBotL\":%.1f,\"EAv\":%.1f,\"EQtot\":%.2f,"
+      "\"Solar\":%.1f,\"dT\":%.1f,\"dEQ\":%.3f,\"pwmVal\":%d,"
+      "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d}",
+      uptime_sec,
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL, EAv, EQtot,
+      Tsun, dT, dEQ, pwm_value,
+      pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize()
+    );
+    request->send(200, "application/json", json);
+  });
+  
+  // Graph data
+  server.on("/graph_data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", getGraphDataJSON());
+  });
+  
+  // Save settings
+  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Parse parameters (simplified - full implementation needed)
+    if (request->hasParam("ssid")) {
+      String ssid = request->getParam("ssid")->value();
+      strncpy(config.wifi_ssid, ssid.c_str(), sizeof(config.wifi_ssid) - 1);
+    }
+    if (request->hasParam("password")) {
+      String pass = request->getParam("password")->value();
+      strncpy(config.wifi_pass, pass.c_str(), sizeof(config.wifi_pass) - 1);
+    }
+    // ... (more parameters)
+    
+    saveConfig();
+    request->send(200, "text/plain", "Settings saved. Rebooting...");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  // Manual pump control
+  server.on("/pump_on", HTTP_GET, [](AsyncWebServerRequest *request) {
+    controlPump(true, PWM_MAX);
+    pump_status = "MANUAL ON";
+    request->send(200, "text/plain", "Pump ON");
+  });
+  
+  server.on("/pump_off", HTTP_GET, [](AsyncWebServerRequest *request) {
+    controlPump(false, 0);
+    pump_status = "MANUAL OFF";
+    request->send(200, "text/plain", "Pump OFF");
+  });
+  
+  server.on("/pump_auto", HTTP_GET, [](AsyncWebServerRequest *request) {
+    pump_status = "AUTO";
+    request->send(200, "text/plain", "Pump AUTO");
+  });
+  
+  // Reboot
+  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Rebooting...");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  // OTA update page (simplified)
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html><body><h1>OTA Update</h1>";
+    html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+    html += "<input type='file' name='update'><input type='submit' value='Upload'>";
+    html += "</form></body></html>";
+    request->send(200, "text/html", html);
+  });
+  
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool should_reboot = !Update.hasError();
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", 
+      should_reboot ? "OK" : "FAIL");
+    response->addHeader("Connection", "close");
+    request->send(response);
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    if (!index) {
+      Serial.printf("Update Start: %s\n", filename.c_str());
+      if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
+        Update.printError(Serial);
+      }
+    }
+    if (!Update.hasError()) {
+      if (Update.write(data, len) != len) {
+        Update.printError(Serial);
+      }
+    }
+    if (final) {
+      if (Update.end(true)) {
+        Serial.printf("Update Success: %uB\n", index + len);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+  
+  server.begin();
+  Serial.println("Web server started");
+}
+
+// ============================================================================
+// WEB PAGES (to be continued in next part...)
+// ============================================================================
+
+String getFormattedDateTime() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  
+  char buffer[32];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+String getMainPage() {
+  String html;
+  html.reserve(20000);
+  
+  html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( Status</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {padding:15px;}
+    .section {border:2px solid #369;border-radius:8px;padding:15px;margin-bottom:15px;background:#f9f9f9;}
+    .section-title {font-size:17px;font-weight:bold;color:#369;margin-bottom:10px;border-bottom:2px solid #369;padding-bottom:5px;}
+    table {width:100%;border-collapse:collapse;}
+    td.label {color:#369;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;}
+    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;font-weight:bold;}
+    .gauge {width:100%;height:40px;background:#eee;border-radius:5px;position:relative;margin:10px 0;}
+    .gauge-fill {height:100%;background:linear-gradient(90deg, #0a0, #fa0, #c00);border-radius:5px;transition:width 0.5s;}
+    .gauge-label {position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:bold;color:#000;}
+    .btn {background:#369;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;margin:5px;}
+    .btn:hover {background:#036;}
+    .btn-off {background:#c00;}
+    .btn-off:hover {background:#900;}
+    .pump-badge {display:inline-block;padding:8px 15px;border-radius:6px;font-weight:bold;margin:10px 0;}
+    .pump-on {background:#0a0;color:#fff;}
+    .pump-off {background:#999;color:#fff;}
+    .status-text {font-size:12px;color:#666;font-style:italic;margin-top:5px;}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral(</div>
+    <div class="header-right">)rawliteral" + String(uptime_sec) + " s &nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
+  </div>
+  
+  <div class="container">
+    <!-- Collector Temperature -->
+    <div class="section">
+      <div class="section-title">☀️ COLLECTOR (Dak)</div>
+      <div style="text-align:center;font-size:48px;font-weight:bold;color:#f80;">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
+      <div class="gauge">
+        <div class="gauge-fill" style="width:)rawliteral" + String(constrain(Tsun, 0, 100)) + R"rawliteral(%;"></div>
+        <div class="gauge-label">0°C ← → 100°C</div>
+      </div>
+    </div>
+    
+    <!-- Temperature Differential -->
+    <div class="section">
+      <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT)</div>
+      <table>
+        <tr><td class="label">Collector (Tsun)</td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Boiler input (Tboil)</td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Verschil (dT)</td><td class="value" style="font-size:18px;color:)rawliteral" + 
+          String(dT > DT_START_THRESHOLD ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dT, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Threshold</td><td class="value">Start: )rawliteral" + String(DT_START_THRESHOLD, 1) + 
+          R"rawliteral(°C, Stop: )rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
+      </table>
+    </div>
+    
+    <!-- Pump Status -->
+    <div class="section">
+      <div class="section-title">💨 POMP STATUS</div>
+      <div style="text-align:center;">
+        <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
+          )rawliteral" + String(pump_relay ? "●  AAN" : "○  UIT") + R"rawliteral(
+        </div>
+        <div style="font-size:24px;font-weight:bold;margin:10px 0;">PWM: )rawliteral" + String(pwm_value) + 
+          R"rawliteral(/255 ()rawliteral" + String(pwm_value * 100 / 255) + R"rawliteral(%)</div>
+        <div class="status-text">)rawliteral" + pump_status + R"rawliteral(</div>
+      </div>
+      <table style="margin-top:15px;">
+        <tr><td class="label">Vandaag gestart</td><td class="value">)rawliteral" + String(pump_starts_today) + R"rawliteral(×</td></tr>
+        <tr><td class="label">Draaitijd vandaag</td><td class="value">)rawliteral" + String(pump_minutes_today) + R"rawliteral( min</td></tr>
+        <tr><td class="label">Loss streak</td><td class="value">)rawliteral" + String(consecutive_reductions) + "/" + 
+          String(MAX_LOSS_STREAK) + R"rawliteral(</td></tr>
+      </table>
+    </div>
+    
+    <!-- Boiler Energy -->
+    <div class="section">
+      <div class="section-title">🔋 BOILER ENERGIE</div>
+      <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
+        String(EQtot, 2) + R"rawliteral( kWh</div>
+      <div class="gauge">
+        <div class="gauge-fill" style="width:)rawliteral" + String(constrain(EQtot * 100 / 25, 0, 100)) + R"rawliteral(%;background:#369;"></div>
+        <div class="gauge-label">0 kWh ← → 25 kWh</div>
+      </div>
+      <table style="margin-top:15px;">
+        <tr><td class="label">Gemiddelde temp (EAv)</td><td class="value">)rawliteral" + String(EAv, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Energie verandering (dEQ)</td><td class="value" style="color:)rawliteral" + 
+          String(dEQ > 0 ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dEQ, 3) + R"rawliteral( kWh/10min</td></tr>
+        <tr><td class="label">Opbrengst vandaag</td><td class="value">)rawliteral" + String(yield_today, 1) + R"rawliteral( kWh</td></tr>
+      </table>
+    </div>
+    
+    <!-- Boiler Temperatures -->
+    <div class="section">
+      <div class="section-title">🌡️ BOILER TEMPERATUREN</div>
+      <table>
+        <tr style="background:#369;color:#fff;"><td style="color:#fff;padding:8px;">Zone</td><td style="color:#fff;">High</td><td style="color:#fff;">Low</td></tr>
+        <tr><td class="label">Top</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Mid</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
+        <tr><td class="label">Bottom</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
+      </table>
+    </div>
+    
+    <!-- System Status -->
+    <div class="section">
+      <div class="section-title">⚙️ SYSTEEM</div>
+      <table>
+        <tr><td class="label">WiFi</td><td class="value">)rawliteral" + String(ap_mode ? "AP Mode" : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
+        <tr><td class="label">WiFi RSSI</td><td class="value">)rawliteral" + String(wifi_rssi) + R"rawliteral( dBm</td></tr>
+        <tr><td class="label">Free heap</td><td class="value">)rawliteral" + String((ESP.getFreeHeap() * 100) / ESP.getHeapSize()) + R"rawliteral(%</td></tr>
+        <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral( uur</td></tr>
+      </table>
+    </div>
+    
+    <!-- Navigation -->
+    <div style="text-align:center;margin-top:20px;">
+      <button class="btn" onclick="location.href='/settings'">⚙️ Settings</button>
+      <button class="btn" onclick="location.href='/manual'">🎛️ Manual</button>
+      <button class="btn" onclick="location.href='/json'">📊 JSON</button>
+      <button class="btn" onclick="location.reload()">🔄 Refresh</button>
+    </div>
+  </div>
+  
+  <script>
+    // Auto-refresh every 10s
+    setTimeout(() => location.reload(), 10000);
+  </script>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+String getSettingsPage() {
+  // Settings page implementation (simplified - full version in next file)
+  String html = "<!DOCTYPE html><html><body><h1>Settings</h1>";
+  html += "<p>Settings page under construction...</p>";
+  html += "<a href='/'>Back</a></body></html>";
+  return html;
+}
+
+String getManualPage() {
+  // Manual control page implementation (simplified)
+  String html = "<!DOCTYPE html><html><body><h1>Manual Control</h1>";
+  html += "<button onclick=\"fetch('/pump_on')\">Pump ON</button>";
+  html += "<button onclick=\"fetch('/pump_off')\">Pump OFF</button>";
+  html += "<button onclick=\"fetch('/pump_auto')\">Pump AUTO</button>";
+  html += "<br><a href='/'>Back</a></body></html>";
+  return html;
+}
