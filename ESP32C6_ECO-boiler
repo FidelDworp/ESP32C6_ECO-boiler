@@ -9,15 +9,33 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
- Version 1.0 (11 jan 2026)
- - Initial ESP32-C6 version based on Photon S-ECO_SOLAR
- - Web interface like HVAC V53.4
- - Google Docs JSON logging
- - In-memory graphing (60 samples)
- - NVS configuration
- - OTA updates
+ Version 1.1 (12 jan 2026)
+ * - Optimized pin layout for RJ45 shield
+ * - HVAC V53.4 style UI (sidebar navigation)
+ * - Pump override buttons (60s timer)
+ * - All 6 boiler temps displayed
+ * - System info (IP, mDNS)
+ * - Fixed ledcAttach() for ESP32 core 3.x
+
+ Features:
+✅ Collector temperature gauge (Tsun)
+✅ Temperature differential (dT)
+✅ Pump status + override buttons (ON/OFF 60s)
+✅ Boiler energy (EQtot)
+✅ All 6 boiler temperatures (TopH→BotL)
+✅ System info (IP, mDNS, RSSI, heap, uptime)
+
+SIMULATION MODE (Voor testen!)
+**Enable in sketch** (regel ~44):
+#define SIMULATION_MODE true  // Set to false for real sensors
+- Generates fake realistic data
+- Sun cycle simulation (25-65°C daytime)
+- Stratified boiler temps
+- Working pump logic
+- Perfect for UI testing!
   
  */
+
 
 // ============== INCLUDES ==============
 #include <WiFi.h>
@@ -40,18 +58,18 @@
 // SIMULATION MODE - Set to true for testing without sensors
 #define SIMULATION_MODE false  // Set to true for testing on breadboard
 
-// SPI pins (MAX31865 PT1000)
-#define SPI_CS    10  // Chip Select
-#define SPI_MOSI  11  // MOSI
-#define SPI_MISO  12  // MISO
-#define SPI_SCK   13  // Clock
-
-// 1-Wire pin (DS18B20 boiler sensors)
+// 1-Wire pin (DS18B20 boiler sensors) - RJ45 Connector 1
 #define ONEWIRE_PIN  3
 
-// Pump control
-#define RELAY_PIN  2   // 230V pump relay (active LOW)
-#define PWM_PIN    4   // OEG pump PWM speed control (0-255)
+// Pump control - RJ45 Connector 1 (samen met 1-Wire!)
+#define RELAY_PIN  1   // 230V pump relay (active LOW)
+#define PWM_PIN    5   // OEG pump PWM speed control (0-255)
+
+// SPI pins (MAX31865 PT1000) - Extra vrije pins (groepje bij elkaar!)
+#define SPI_CS    20   // Chip Select
+#define SPI_MOSI  21   // MOSI
+#define SPI_MISO  22   // MISO
+#define SPI_SCK   23   // Clock
 
 // PWM configuration
 #define PWM_FREQ    1000  // 1kHz
@@ -158,6 +176,12 @@ int pwm_value = 0;             // PWM value (0-255)
 String pump_status = "IDLE";   // Status message
 int consecutive_reductions = 0; // Loss streak counter
 
+// Pump override control (like HVAC circuit overrides)
+bool pump_override_active = false;
+bool pump_override_state = false;  // true = ON, false = OFF
+unsigned long pump_override_start = 0;
+const unsigned long PUMP_OVERRIDE_DURATION = 60000UL;  // 60 seconds
+
 // Timing
 unsigned long last_sensor_read = 0;
 unsigned long last_pump_check = 0;
@@ -223,8 +247,16 @@ String getMainPage();
 String getSettingsPage();
 String getManualPage();
 String getGraphDataJSON();
+String getFormattedDateTime();
 float readPT1000();
 float calculatePWM(float dT, float Tsun);
+
+// ============== END OF PART 1/3 ==============
+// Continue with PART 2 for core functions...
+/* ============================================================================
+ * ESP32_ECO_V1_1.ino - PART 2/3
+ * CORE FUNCTIONS: Setup, Loop, Config, Sensors, Pump Logic
+ * ============================================================================ */
 
 // ============================================================================
 // SETUP
@@ -233,9 +265,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n\n=== ESP32 ECO Controller V1.0 ===");
-  Serial.println("Based on: HVAC V53.4 + Photon ECO logic");
-  Serial.println("Features: Web UI, Google Docs JSON, In-memory graphs");
+  Serial.println("\n\n=== ESP32 ECO Controller V1.1 ===");
+  Serial.println("Pin Layout: RJ45 optimized");
+  Serial.println("UI: HVAC V53.4 style");
+  Serial.println("Features: Pump override, 6 temps, system info");
   
   // Check for factory reset (type 'R' within 3s)
   Serial.println("\nFactory reset? Type 'R' within 3 seconds...");
@@ -314,11 +347,6 @@ void loop() {
       publishHVAC();
       last_hvac_publish = millis();
     }
-  }
-  
-  // Track pump runtime
-  if (pump_relay) {
-    // Pump is running
   }
   
   // Reset daily stats at midnight
@@ -486,17 +514,20 @@ void setupPump() {
   pwm_value = 0;
   
   Serial.println("Pump control initialized (Relay + PWM)");
+  Serial.printf("  Relay pin: %d (active LOW)\n", RELAY_PIN);
+  Serial.printf("  PWM pin: %d (%d Hz, %d-bit)\n", PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
 }
 
 void setupSensors() {
   // PT1000 (MAX31865)
   pt1000.begin(MAX31865_2WIRE);
   Serial.println("PT1000 sensor initialized (MAX31865 SPI)");
+  Serial.printf("  SPI pins: CS=%d MOSI=%d MISO=%d SCK=%d\n", SPI_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
   
   // DS18B20 (1-Wire) - OneWireNg doesn't need explicit init
-  // Just verify we can detect sensors
   Serial.println("DS18B20 sensors ready (OneWireNg - ESP32-C6 compatible)");
-  Serial.println("Expected: 6 sensors");
+  Serial.printf("  1-Wire pin: %d\n", ONEWIRE_PIN);
+  Serial.println("  Expected: 6 sensors");
 }
 
 // ============================================================================
@@ -628,7 +659,6 @@ void readSensors() {
     Serial.printf("Tsun (Collector): %.1f°C\n", Tsun);
     
     // DS18B20 (boiler) - Manual reading with OneWireNg (ESP32-C6 compatible!)
-    // This is the SAME method as HVAC V53.4
     float temps[6];
     
     for (int i = 0; i < 6; i++) {
@@ -734,11 +764,44 @@ void calculateEnergy() {
     EQtot, EQ1, EQ2, EQ3, EQ4, EQ5);
 }
 
+// Continue with PART 3 for pump logic and web interface...
+
+// ============== END OF PART 2/3 ==============
+/* ============================================================================
+ * ESP32_ECO_V1_1.ino - PART 3A/3
+ * PUMP LOGIC & HELPER FUNCTIONS
+ * ============================================================================ */
+
 // ============================================================================
 // PUMP CONTROL LOGIC
 // ============================================================================
 void checkPumpLogic() {
   Serial.println("\n=== Pump Logic Check ===");
+  
+  // CHECK OVERRIDE FIRST (like HVAC circuit overrides!)
+  if (pump_override_active) {
+    unsigned long elapsed = millis() - pump_override_start;
+    
+    if (elapsed < PUMP_OVERRIDE_DURATION) {
+      // Override still active
+      unsigned long remaining = (PUMP_OVERRIDE_DURATION - elapsed) / 1000;
+      
+      Serial.printf("⚠️ OVERRIDE %s (%lu seconds remaining)\n", 
+        pump_override_state ? "ON" : "OFF", remaining);
+      
+      // Apply override state
+      controlPump(pump_override_state, pump_override_state ? PWM_MAX : 0);
+      pump_status = pump_override_state ? "OVERRIDE ON" : "OVERRIDE OFF";
+      
+      return;  // Skip normal logic!
+    } else {
+      // Override expired
+      Serial.println("Override timeout - terug naar AUTO");
+      pump_override_active = false;
+    }
+  }
+  
+  // NORMAL PUMP LOGIC (from Photon)
   
   // Get current hour
   time_t now;
@@ -845,7 +908,7 @@ void controlPump(bool state, int pwm) {
   // Relay (active LOW)
   digitalWrite(RELAY_PIN, state ? LOW : HIGH);
   
-  // PWM
+  // PWM (ESP32 core 3.x API)
   ledcWrite(PWM_PIN, state ? pwm : 0);
 }
 
@@ -957,7 +1020,396 @@ String getGraphDataJSON() {
 }
 
 // ============================================================================
-// WEB SERVER SETUP
+// HELPER FUNCTIONS
+// ============================================================================
+String getFormattedDateTime() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  
+  char buffer[32];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+// ============== END OF PART 3A/3 ==============
+// Continue with PART 3B for web interface...
+/* ============================================================================
+ * ESP32_ECO_V1_1.ino - PART 3B/3 - FINAL
+ * WEB INTERFACE & SERVER ENDPOINTS
+ * 
+ * PLAK ALLE 4 DELEN ACHTER ELKAAR:
+ * 1. PART1 (headers, config, globals)
+ * 2. PART2 (setup, loop, sensors)
+ * 3. PART3A (pump logic, helpers)
+ * 4. PART3B (dit bestand - web interface)
+ * 
+ * Dan heb je de COMPLETE sketch!
+ * ============================================================================ */
+
+// ============================================================================
+// WEB PAGES - Main Status Page
+// ============================================================================
+String getMainPage() {
+  String html;
+  html.reserve(50000);
+  
+  html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( Status</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;margin:8px auto;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:15px;overflow-y:auto;}
+    .section {border:2px solid #369;border-radius:8px;padding:15px;margin-bottom:15px;background:#f9f9f9;}
+    .section-title {font-size:17px;font-weight:bold;color:#369;margin-bottom:10px;border-bottom:2px solid #369;padding-bottom:5px;}
+    table {width:100%;border-collapse:collapse;}
+    td.label {color:#369;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;}
+    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;font-weight:bold;}
+    tr.header-row {background:#336699;color:#fff;}
+    tr.header-row td {color:#fff;font-weight:bold;padding:10px 5px;font-size:12px;}
+    .gauge {width:100%;height:40px;background:#eee;border-radius:5px;position:relative;margin:10px 0;}
+    .gauge-fill {height:100%;background:linear-gradient(90deg, #0a0, #fa0, #c00);border-radius:5px;transition:width 0.5s;}
+    .gauge-label {position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:bold;color:#000;font-size:24px;}
+    .refresh-btn {background:#369;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;margin:20px 0;width:100%;max-width:300px;}
+    .refresh-btn:hover {background:#036;}
+    .btn-override {padding:4px 8px;margin:2px;font-size:11px;cursor:pointer;border:none;border-radius:4px;background:#369;color:#fff;}
+    .btn-override:hover {background:#036;}
+    .btn-override-cancel {background:#c00;}
+    .btn-override-cancel:hover {background:#900;}
+    .override-badge {background:#c00;color:#fff;padding:4px 8px;border-radius:4px;font-size:11px;font-weight:bold;}
+    .override-badge-off {background:#666;color:#fff;}
+    .pump-badge {display:inline-block;padding:8px 15px;border-radius:6px;font-weight:bold;margin:10px 0;}
+    .pump-on {background:#0a0;color:#fff;}
+    .pump-off {background:#999;color:#fff;}
+    .status-text {font-size:12px;color:#666;font-style:italic;margin-top:5px;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">)rawliteral" + String(uptime_sec) + " s &nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/" class="active">Status</a>
+      <a href="/update">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
+    </div>
+    <div class="main">
+      
+      <!-- Collector Temperature -->
+      <div class="section">
+        <div class="section-title">☀️ COLLECTOR (Dak)</div>
+        <div class="gauge">
+          <div class="gauge-fill" style="width:)rawliteral" + String(constrain(Tsun, 0, 100)) + R"rawliteral(%;"></div>
+          <div class="gauge-label">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
+        </div>
+      </div>
+      
+      <!-- Temperature Differential -->
+      <div class="section">
+        <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT)</div>
+        <table>
+          <tr><td class="label">Collector (Tsun)</td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Boiler input (Tboil)</td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Verschil (dT)</td><td class="value" style="font-size:18px;color:)rawliteral" + 
+            String(dT > DT_START_THRESHOLD ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dT, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Threshold</td><td class="value">Start: )rawliteral" + String(DT_START_THRESHOLD, 1) + 
+            R"rawliteral(°C, Stop: )rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
+        </table>
+      </div>
+      
+      <!-- Pump Status with Override Controls -->
+      <div class="section">
+        <div class="section-title">💨 POMP STATUS</div>
+        <div style="text-align:center;">
+          <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
+            )rawliteral" + String(pump_relay ? "●  AAN" : "○  UIT") + R"rawliteral(
+          </div>
+          <div style="font-size:24px;font-weight:bold;margin:10px 0;">PWM: )rawliteral" + String(pwm_value) + 
+            R"rawliteral(/255 ()rawliteral" + String(pwm_value * 100 / 255) + R"rawliteral(%)</div>
+          <div class="status-text">)rawliteral" + pump_status + R"rawliteral(</div>
+        </div>
+        <table style="margin-top:15px;">
+          <tr><td class="label">Vandaag gestart</td><td class="value">)rawliteral" + String(pump_starts_today) + R"rawliteral(×</td></tr>
+          <tr><td class="label">Draaitijd vandaag</td><td class="value">)rawliteral" + String(pump_minutes_today) + R"rawliteral( min</td></tr>
+          <tr><td class="label">Loss streak</td><td class="value">)rawliteral" + String(consecutive_reductions) + "/" + 
+            String(MAX_LOSS_STREAK) + R"rawliteral(</td></tr>
+          <tr><td class="label">Override</td><td class="value">)rawliteral";
+  
+  // Pump override buttons with timer
+  if (pump_override_active) {
+    unsigned long elapsed = millis() - pump_override_start;
+    if (elapsed < PUMP_OVERRIDE_DURATION) {
+      unsigned long remaining = (PUMP_OVERRIDE_DURATION - elapsed) / 1000;
+      String badge_class = pump_override_state ? "override-badge" : "override-badge override-badge-off";
+      String badge_text = pump_override_state ? "ON" : "OFF";
+      
+      html += "<span class=\"" + badge_class + " timer\" data-remaining=\"" + String(remaining) + "\">" + 
+              badge_text + " " + String(remaining / 60) + ":" + String(remaining % 60, DEC) + "</span> ";
+      html += "<button class=\"btn-override btn-override-cancel\" onclick=\"cancelPumpOverride()\">×</button>";
+    } else {
+      html += "<button class=\"btn-override\" onclick=\"setPumpOverride(true)\">ON</button> ";
+      html += "<button class=\"btn-override\" onclick=\"setPumpOverride(false)\">OFF</button>";
+    }
+  } else {
+    html += "<button class=\"btn-override\" onclick=\"setPumpOverride(true)\">ON</button> ";
+    html += "<button class=\"btn-override\" onclick=\"setPumpOverride(false)\">OFF</button>";
+  }
+  
+  html += R"rawliteral(
+          </td></tr>
+        </table>
+      </div>
+      
+      <!-- Boiler Energy -->
+      <div class="section">
+        <div class="section-title">🔋 BOILER ENERGIE</div>
+        <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
+          String(EQtot, 2) + R"rawliteral( kWh</div>
+        <div class="gauge">
+          <div class="gauge-fill" style="width:)rawliteral" + String(constrain(EQtot * 100 / 25, 0, 100)) + R"rawliteral(%;background:#369;"></div>
+        </div>
+        <table style="margin-top:15px;">
+          <tr><td class="label">Gemiddelde temp (EAv)</td><td class="value">)rawliteral" + String(EAv, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Energie verandering (dEQ)</td><td class="value" style="color:)rawliteral" + 
+            String(dEQ > 0 ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dEQ, 3) + R"rawliteral( kWh/10min</td></tr>
+          <tr><td class="label">Opbrengst vandaag</td><td class="value">)rawliteral" + String(yield_today, 1) + R"rawliteral( kWh</td></tr>
+        </table>
+      </div>
+      
+      <!-- Boiler Temperatures - ALL 6 -->
+      <div class="section">
+        <div class="section-title">🌡️ BOILER TEMPERATUREN</div>
+        <table>
+          <tr class="header-row"><td>Zone</td><td>Temperatuur</td></tr>
+          <tr><td class="label">ETopH (Top High)</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">ETopL (Top Low)</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">EMidH (Mid High)</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">EMidL (Mid Low)</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">EBotH (Bottom High)</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">EBotL (Bottom Low)</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
+        </table>
+      </div>
+      
+      <!-- System Status -->
+      <div class="section">
+        <div class="section-title">⚙️ SYSTEEM</div>
+        <table>
+          <tr><td class="label">WiFi IP</td><td class="value">)rawliteral" + (ap_mode ? "AP: " + WiFi.softAPIP().toString() : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
+          <tr><td class="label">mDNS naam</td><td class="value">http://)rawliteral" + String(config.room_id) + R"rawliteral(.local</td></tr>
+          <tr><td class="label">WiFi RSSI</td><td class="value">)rawliteral" + String(wifi_rssi) + R"rawliteral( dBm</td></tr>
+          <tr><td class="label">Free heap</td><td class="value">)rawliteral" + String((ESP.getFreeHeap() * 100) / ESP.getHeapSize()) + R"rawliteral(%</td></tr>
+          <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral( uur</td></tr>
+        </table>
+      </div>
+      
+      <!-- Refresh Button -->
+      <div style="text-align:center;">
+        <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    function setPumpOverride(state) {
+      const endpoint = state ? '/pump_override_on' : '/pump_override_off';
+      fetch(endpoint).then(() => setTimeout(() => location.reload(), 500));
+    }
+    
+    function cancelPumpOverride() {
+      fetch('/pump_override_cancel').then(() => setTimeout(() => location.reload(), 500));
+    }
+    
+    // Timer countdown (like HVAC)
+    setInterval(() => {
+      document.querySelectorAll('.timer').forEach(badge => {
+        let remaining = parseInt(badge.dataset.remaining);
+        if (remaining > 0) {
+          remaining--;
+          badge.dataset.remaining = remaining;
+          const state = badge.textContent.split(' ')[0];
+          badge.textContent = state + ' ' + Math.floor(remaining/60) + ':' + (remaining%60).toString().padStart(2,'0');
+        } else if (remaining === 0) {
+          setTimeout(() => location.reload(), 1000);
+        }
+      });
+    }, 1000);
+    
+    // Auto-refresh every 30s
+    setTimeout(() => location.reload(), 30000);
+  </script>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+// ============================================================================
+// WEB PAGES - Settings Page
+// ============================================================================
+String getSettingsPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:20px;overflow-y:auto;}
+    h2 {color:#369;border-bottom:2px solid #369;padding-bottom:10px;}
+    table {width:100%;margin:15px 0;}
+    td {padding:10px;}
+    input,select {padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
+    .btn {background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
+    .btn:hover {background:#036;}
+    .warning {background:#ffe6e6;border:2px solid #c00;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#900;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">Settings</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/">Status</a>
+      <a href="/update">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings" class="active">Settings</a>
+    </div>
+    <div class="main">
+      <div class="warning">⚠️ OPGEPAST: Settings pagina nog in ontwikkeling!<br>Gebruik voorlopig NVS via Serial Monitor.</div>
+      
+      <h2>WiFi Configuratie</h2>
+      <table>
+        <tr><td>Current SSID</td><td>)rawliteral" + String(config.wifi_ssid) + R"rawliteral(</td></tr>
+        <tr><td>Current IP</td><td>)rawliteral" + (ap_mode ? "AP Mode" : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
+      </table>
+      
+      <h2>Pump Settings</h2>
+      <table>
+        <tr><td>dT Start Threshold</td><td>)rawliteral" + String(DT_START_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
+        <tr><td>dT Stop Threshold</td><td>)rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
+        <tr><td>Tsun Minimum</td><td>)rawliteral" + String(TSUN_MIN_TEMP, 1) + R"rawliteral(°C</td></tr>
+      </table>
+      
+      <p style="text-align:center;color:#666;font-style:italic;">
+        Full settings editor coming soon...<br>
+        For now, use Serial commands or factory reset to reconfigure.
+      </p>
+      
+      <div style="text-align:center;">
+        <a href="/" class="btn">← Terug naar Status</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+// ============================================================================
+// WEB PAGES - Manual Control Page
+// ============================================================================
+String getManualPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - Manual</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:20px;overflow-y:auto;}
+    h2 {color:#369;}
+    .btn {background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:10px;}
+    .btn:hover {background:#036;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">Manual Control</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/">Status</a>
+      <a href="/update">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
+    </div>
+    <div class="main">
+      <h2>Manual Pump Control</h2>
+      <p>Override buttons available on main Status page.</p>
+      <div style="text-align:center;">
+        <a href="/" class="btn">← Terug naar Status</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+// ============================================================================
+// WEB SERVER SETUP & ENDPOINTS
 // ============================================================================
 void setupWebServer() {
   // Main page
@@ -980,9 +1432,8 @@ void setupWebServer() {
     request->send(200, "text/html", getManualPage());
   });
   
-  // JSON endpoint (Google Docs compatible - Photon format with uptime first)
+  // JSON endpoint (Google Docs compatible - Photon format with uptime first!)
   server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Exact Photon format maar met uptime vooraan (zoals HVAC)
     char json[400];
     snprintf(json, sizeof(json), 
       "{\"uptime\":%lu,"
@@ -1003,41 +1454,37 @@ void setupWebServer() {
     request->send(200, "application/json", getGraphDataJSON());
   });
   
-  // Save settings
-  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Parse parameters (simplified - full implementation needed)
-    if (request->hasParam("ssid")) {
-      String ssid = request->getParam("ssid")->value();
-      strncpy(config.wifi_ssid, ssid.c_str(), sizeof(config.wifi_ssid) - 1);
-    }
-    if (request->hasParam("password")) {
-      String pass = request->getParam("password")->value();
-      strncpy(config.wifi_pass, pass.c_str(), sizeof(config.wifi_pass) - 1);
-    }
-    // ... (more parameters)
+  // Pump override ON
+  server.on("/pump_override_on", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE ON ===");
+    Serial.println("Duration: 60 seconds");
     
-    saveConfig();
-    request->send(200, "text/plain", "Settings saved. Rebooting...");
-    delay(1000);
-    ESP.restart();
+    pump_override_active = true;
+    pump_override_state = true;
+    pump_override_start = millis();
+    
+    request->send(200, "text/plain", "Pump override ON (60s)");
   });
   
-  // Manual pump control
-  server.on("/pump_on", HTTP_GET, [](AsyncWebServerRequest *request) {
-    controlPump(true, PWM_MAX);
-    pump_status = "MANUAL ON";
-    request->send(200, "text/plain", "Pump ON");
+  // Pump override OFF
+  server.on("/pump_override_off", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE OFF ===");
+    Serial.println("Duration: 60 seconds");
+    
+    pump_override_active = true;
+    pump_override_state = false;
+    pump_override_start = millis();
+    
+    request->send(200, "text/plain", "Pump override OFF (60s)");
   });
   
-  server.on("/pump_off", HTTP_GET, [](AsyncWebServerRequest *request) {
-    controlPump(false, 0);
-    pump_status = "MANUAL OFF";
-    request->send(200, "text/plain", "Pump OFF");
-  });
-  
-  server.on("/pump_auto", HTTP_GET, [](AsyncWebServerRequest *request) {
-    pump_status = "AUTO";
-    request->send(200, "text/plain", "Pump AUTO");
+  // Pump override CANCEL
+  server.on("/pump_override_cancel", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE CANCELLED ===");
+    
+    pump_override_active = false;
+    
+    request->send(200, "text/plain", "Pump override cancelled");
   });
   
   // Reboot
@@ -1047,218 +1494,83 @@ void setupWebServer() {
     ESP.restart();
   });
   
-  // OTA update page (simplified)
+  // OTA update page
   server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String html = "<!DOCTYPE html><html><body><h1>OTA Update</h1>";
-    html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
-    html += "<input type='file' name='update'><input type='submit' value='Upload'>";
-    html += "</form></body></html>";
-    request->send(200, "text/html", html);
-  });
-  
-  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
-    bool should_reboot = !Update.hasError();
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", 
-      should_reboot ? "OK" : "FAIL");
-    response->addHeader("Connection", "close");
-    request->send(response);
-  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    if (!index) {
-      Serial.printf("Update Start: %s\n", filename.c_str());
-      if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
-        Update.printError(Serial);
-      }
-    }
-    if (!Update.hasError()) {
-      if (Update.write(data, len) != len) {
-        Update.printError(Serial);
-      }
-    }
-    if (final) {
-      if (Update.end(true)) {
-        Serial.printf("Update Success: %uB\n", index + len);
-      } else {
-        Update.printError(Serial);
-      }
-    }
-  });
-  
-  server.begin();
-  Serial.println("Web server started");
-}
-
-// ============================================================================
-// WEB PAGES (to be continued in next part...)
-// ============================================================================
-
-String getFormattedDateTime() {
-  time_t now;
-  struct tm timeinfo;
-  time(&now);
-  localtime_r(&now, &timeinfo);
-  
-  char buffer[32];
-  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
-  return String(buffer);
-}
-
-String getMainPage() {
-  String html;
-  html.reserve(20000);
-  
-  html = R"rawliteral(
+    String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="nl">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>)rawliteral" + String(config.room_id) + R"rawliteral( Status</title>
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - OTA</title>
   <style>
     body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
-    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
     .header-left {flex:1;}
     .header-right {flex:1;text-align:right;font-size:15px;}
-    .container {padding:15px;}
-    .section {border:2px solid #369;border-radius:8px;padding:15px;margin-bottom:15px;background:#f9f9f9;}
-    .section-title {font-size:17px;font-weight:bold;color:#369;margin-bottom:10px;border-bottom:2px solid #369;padding-bottom:5px;}
-    table {width:100%;border-collapse:collapse;}
-    td.label {color:#369;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;}
-    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;font-weight:bold;}
-    .gauge {width:100%;height:40px;background:#eee;border-radius:5px;position:relative;margin:10px 0;}
-    .gauge-fill {height:100%;background:linear-gradient(90deg, #0a0, #fa0, #c00);border-radius:5px;transition:width 0.5s;}
-    .gauge-label {position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:bold;color:#000;}
-    .btn {background:#369;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;margin:5px;}
-    .btn:hover {background:#036;}
-    .btn-off {background:#c00;}
-    .btn-off:hover {background:#900;}
-    .pump-badge {display:inline-block;padding:8px 15px;border-radius:6px;font-weight:bold;margin:10px 0;}
-    .pump-on {background:#0a0;color:#fff;}
-    .pump-off {background:#999;color:#fff;}
-    .status-text {font-size:12px;color:#666;font-style:italic;margin-top:5px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:20px;overflow-y:auto;text-align:center;}
+    h1 {color:#369;}
+    .button {background:#369;color:#fff;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin:10px;}
+    .button:hover {background:#036;}
+    .reboot {background:#c00;}
+    .reboot:hover {background:#900;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
   </style>
 </head>
 <body>
   <div class="header">
-    <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral(</div>
-    <div class="header-right">)rawliteral" + String(uptime_sec) + " s &nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">OTA Update</div>
   </div>
-  
   <div class="container">
-    <!-- Collector Temperature -->
-    <div class="section">
-      <div class="section-title">☀️ COLLECTOR (Dak)</div>
-      <div style="text-align:center;font-size:48px;font-weight:bold;color:#f80;">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
-      <div class="gauge">
-        <div class="gauge-fill" style="width:)rawliteral" + String(constrain(Tsun, 0, 100)) + R"rawliteral(%;"></div>
-        <div class="gauge-label">0°C ← → 100°C</div>
-      </div>
+    <div class="sidebar">
+      <a href="/">Status</a>
+      <a href="/update" class="active">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
     </div>
-    
-    <!-- Temperature Differential -->
-    <div class="section">
-      <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT)</div>
-      <table>
-        <tr><td class="label">Collector (Tsun)</td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Boiler input (Tboil)</td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Verschil (dT)</td><td class="value" style="font-size:18px;color:)rawliteral" + 
-          String(dT > DT_START_THRESHOLD ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dT, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Threshold</td><td class="value">Start: )rawliteral" + String(DT_START_THRESHOLD, 1) + 
-          R"rawliteral(°C, Stop: )rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
-      </table>
-    </div>
-    
-    <!-- Pump Status -->
-    <div class="section">
-      <div class="section-title">💨 POMP STATUS</div>
-      <div style="text-align:center;">
-        <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
-          )rawliteral" + String(pump_relay ? "●  AAN" : "○  UIT") + R"rawliteral(
-        </div>
-        <div style="font-size:24px;font-weight:bold;margin:10px 0;">PWM: )rawliteral" + String(pwm_value) + 
-          R"rawliteral(/255 ()rawliteral" + String(pwm_value * 100 / 255) + R"rawliteral(%)</div>
-        <div class="status-text">)rawliteral" + pump_status + R"rawliteral(</div>
-      </div>
-      <table style="margin-top:15px;">
-        <tr><td class="label">Vandaag gestart</td><td class="value">)rawliteral" + String(pump_starts_today) + R"rawliteral(×</td></tr>
-        <tr><td class="label">Draaitijd vandaag</td><td class="value">)rawliteral" + String(pump_minutes_today) + R"rawliteral( min</td></tr>
-        <tr><td class="label">Loss streak</td><td class="value">)rawliteral" + String(consecutive_reductions) + "/" + 
-          String(MAX_LOSS_STREAK) + R"rawliteral(</td></tr>
-      </table>
-    </div>
-    
-    <!-- Boiler Energy -->
-    <div class="section">
-      <div class="section-title">🔋 BOILER ENERGIE</div>
-      <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
-        String(EQtot, 2) + R"rawliteral( kWh</div>
-      <div class="gauge">
-        <div class="gauge-fill" style="width:)rawliteral" + String(constrain(EQtot * 100 / 25, 0, 100)) + R"rawliteral(%;background:#369;"></div>
-        <div class="gauge-label">0 kWh ← → 25 kWh</div>
-      </div>
-      <table style="margin-top:15px;">
-        <tr><td class="label">Gemiddelde temp (EAv)</td><td class="value">)rawliteral" + String(EAv, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Energie verandering (dEQ)</td><td class="value" style="color:)rawliteral" + 
-          String(dEQ > 0 ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dEQ, 3) + R"rawliteral( kWh/10min</td></tr>
-        <tr><td class="label">Opbrengst vandaag</td><td class="value">)rawliteral" + String(yield_today, 1) + R"rawliteral( kWh</td></tr>
-      </table>
-    </div>
-    
-    <!-- Boiler Temperatures -->
-    <div class="section">
-      <div class="section-title">🌡️ BOILER TEMPERATUREN</div>
-      <table>
-        <tr style="background:#369;color:#fff;"><td style="color:#fff;padding:8px;">Zone</td><td style="color:#fff;">High</td><td style="color:#fff;">Low</td></tr>
-        <tr><td class="label">Top</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Mid</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
-        <tr><td class="label">Bottom</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
-      </table>
-    </div>
-    
-    <!-- System Status -->
-    <div class="section">
-      <div class="section-title">⚙️ SYSTEEM</div>
-      <table>
-        <tr><td class="label">WiFi</td><td class="value">)rawliteral" + String(ap_mode ? "AP Mode" : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
-        <tr><td class="label">WiFi RSSI</td><td class="value">)rawliteral" + String(wifi_rssi) + R"rawliteral( dBm</td></tr>
-        <tr><td class="label">Free heap</td><td class="value">)rawliteral" + String((ESP.getFreeHeap() * 100) / ESP.getHeapSize()) + R"rawliteral(%</td></tr>
-        <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral( uur</td></tr>
-      </table>
-    </div>
-    
-    <!-- Navigation -->
-    <div style="text-align:center;margin-top:20px;">
-      <button class="btn" onclick="location.href='/settings'">⚙️ Settings</button>
-      <button class="btn" onclick="location.href='/manual'">🎛️ Manual</button>
-      <button class="btn" onclick="location.href='/json'">📊 JSON</button>
-      <button class="btn" onclick="location.reload()">🔄 Refresh</button>
+    <div class="main">
+      <h1>OTA Firmware Update</h1>
+      <form method="POST" action="/update" enctype="multipart/form-data">
+        <input type="file" name="update" accept=".bin"><br><br>
+        <button class="button" type="submit">Upload Firmware</button>
+      </form><br>
+      <button class="button reboot" onclick="if(confirm('Reboot?'))location.href='/reboot'">Reboot</button>
+      <br><br><a href="/" style="color:#369;">← Terug naar Status</a>
     </div>
   </div>
-  
-  <script>
-    // Auto-refresh every 10s
-    setTimeout(() => location.reload(), 10000);
-  </script>
 </body>
 </html>
 )rawliteral";
+    request->send(200, "text/html", html);
+  });
   
-  return html;
-}
-
-String getSettingsPage() {
-  // Settings page implementation (simplified - full version in next file)
-  String html = "<!DOCTYPE html><html><body><h1>Settings</h1>";
-  html += "<p>Settings page under construction...</p>";
-  html += "<a href='/'>Back</a></body></html>";
-  return html;
-}
-
-String getManualPage() {
-  // Manual control page implementation (simplified)
-  String html = "<!DOCTYPE html><html><body><h1>Manual Control</h1>";
-  html += "<button onclick=\"fetch('/pump_on')\">Pump ON</button>";
-  html += "<button onclick=\"fetch('/pump_off')\">Pump OFF</button>";
-  html += "<button onclick=\"fetch('/pump_auto')\">Pump AUTO</button>";
-  html += "<br><a href='/'>Back</a></body></html>";
-  return html;
+  // OTA update handler
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool success = !Update.hasError();
+    request->send(200, "text/html", success 
+      ? "<h2 style='color:#0f0'>Update OK!</h2><p>Rebooting...</p>" 
+      : "<h2 style='color:#f00'>Update FAILED!</h2>");
+    if (success) { delay(1000); ESP.restart(); }
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    if (!index) {
+      Serial.println("\n=== OTA UPDATE ===");
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    }
+    Update.write(data, len);
+    if (final && Update.end(true)) Serial.println("OTA OK");
+  });
+  
+  server.begin();
+  Serial.println("Web server started");
 }
