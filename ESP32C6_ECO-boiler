@@ -9,7 +9,16 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
- Version 1.1 (12 jan 2026)
+ Version 1.2 (12 jan 2026 @ 22:30)
+
+ * Changes from V1.1:
+ * - Complete settings page (like HVAC V53.4)
+ * - Captive portal for AP mode setup
+ * - All parameters configurable via web
+ * - NVS storage for all settings
+ * - Improved WiFi stability
+ * 
+ * Previous changes (V1.1):
  * - Optimized pin layout for RJ45 shield
  * - HVAC V53.4 style UI (sidebar navigation)
  * - Pump override buttons (60s timer)
@@ -17,15 +26,7 @@
  * - System info (IP, mDNS)
  * - Fixed ledcAttach() for ESP32 core 3.x
 
- Features:
-✅ Collector temperature gauge (Tsun)
-✅ Temperature differential (dT)
-✅ Pump status + override buttons (ON/OFF 60s)
-✅ Boiler energy (EQtot)
-✅ All 6 boiler temperatures (TopH→BotL)
-✅ System info (IP, mDNS, RSSI, heap, uptime)
-
-SIMULATION MODE (Voor testen!)
+Opm: SIMULATION MODE (Voor testen!)
 **Enable in sketch** (regel ~44):
 #define SIMULATION_MODE true  // Set to false for real sensors
 - Generates fake realistic data
@@ -33,7 +34,6 @@ SIMULATION MODE (Voor testen!)
 - Stratified boiler temps
 - Working pump logic
 - Perfect for UI testing!
-  
  */
 
 
@@ -105,9 +105,9 @@ const unsigned long HVAC_PUBLISH_INTERVAL = 300000; // 5 min - HVAC update
 const float RREF = 4000.0;    // Reference resistance (Chinese modules)
 const float RNOMINAL = 1000.0; // PT1000 @ 0°C
 
-// Operating hours
-const int HOUR_START = 7;     // Start hour (morning)
-const int HOUR_END = 21;      // End hour (evening)
+// Operating hours (mutable - can be changed via settings)
+int HOUR_START = 7;     // Start hour (morning)
+int HOUR_END = 21;      // End hour (evening)
 
 // HVAC integration threshold
 float HVAC_TRANSFER_THRESHOLD = 15.0;  // kWh - Trigger HVAC transfer
@@ -146,6 +146,16 @@ struct Config {
   float boiler_volume;
   float hvac_threshold;
 } config;
+
+// Sensor nicknames (global)
+String sensor_nicknames[6] = {
+  "ETopH (Top High)",
+  "ETopL (Top Low)", 
+  "EMidH (Mid High)",
+  "EMidL (Mid Low)",
+  "EBotH (Bottom High)",
+  "EBotL (Bottom Low)"
+};
 
 // ============== SENSOR DATA ==============
 // DS18B20 addresses (from Photon sketch) - OneWireNg format for ESP32-C6!
@@ -215,19 +225,37 @@ struct GraphData {
 
 // ============== NVS KEYS ==============
 #define NVS_NAMESPACE "eco-config"
+// WiFi & System
 #define NVS_ROOM_ID "room_id"
 #define NVS_WIFI_SSID "wifi_ssid"
 #define NVS_WIFI_PASS "wifi_pass"
 #define NVS_STATIC_IP "static_ip"
-#define NVS_HVAC_IP "hvac_ip"
-#define NVS_HVAC_MDNS "hvac_mdns"
-#define NVS_HVAC_ENABLED "hvac_enabled"
+// Pump thresholds
 #define NVS_DT_START "dt_start"
 #define NVS_DT_STOP "dt_stop"
 #define NVS_TSUN_MIN "tsun_min"
+#define NVS_TSUN_OVERHEAT "tsun_overheat"
+#define NVS_TSUN_HIGH "tsun_high"
+#define NVS_MAX_LOSS_STREAK "max_loss"
+// PWM settings
+#define NVS_PWM_MIN "pwm_min"
+#define NVS_PWM_MAX "pwm_max"
+#define NVS_PWM_OVERHEAT "pwm_overheat"
+// Energy calculation
 #define NVS_ETMIN "etmin"
 #define NVS_GLYCOL_PCT "glycol_pct"
+#define NVS_BOILER_VOL "boiler_vol"
+#define NVS_ZONE_VOL_BASE "zone_vol_"
+// Operating hours
+#define NVS_HOUR_START "hour_start"
+#define NVS_HOUR_END "hour_end"
+// HVAC integration
+#define NVS_HVAC_ENABLED "hvac_enabled"
+#define NVS_HVAC_IP "hvac_ip"
+#define NVS_HVAC_MDNS "hvac_mdns"
 #define NVS_HVAC_THRESH "hvac_thresh"
+// Sensor nicknames
+#define NVS_SENSOR_NICK_BASE "sensor_"
 
 // ============== FUNCTION DECLARATIONS ==============
 void loadConfig();
@@ -442,22 +470,56 @@ void loadConfig() {
   strncpy(config.hvac_mdns, temp.c_str(), sizeof(config.hvac_mdns) - 1);
   
   config.hvac_enabled = preferences.getBool(NVS_HVAC_ENABLED, true);
-  
-  // Thresholds
-  config.dt_start = preferences.getFloat(NVS_DT_START, DT_START_THRESHOLD);
-  config.dt_stop = preferences.getFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
-  config.tsun_min = preferences.getFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
-  config.etmin = preferences.getFloat(NVS_ETMIN, ETMIN);
-  config.glycol_percent = preferences.getFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
   config.hvac_threshold = preferences.getFloat(NVS_HVAC_THRESH, HVAC_TRANSFER_THRESHOLD);
   
-  // Copy to globals (for easy access)
-  DT_START_THRESHOLD = config.dt_start;
-  DT_STOP_THRESHOLD = config.dt_stop;
-  TSUN_MIN_TEMP = config.tsun_min;
-  ETMIN = config.etmin;
-  GLYCOL_PERCENT = config.glycol_percent;
-  HVAC_TRANSFER_THRESHOLD = config.hvac_threshold;
+  // Pump thresholds
+  DT_START_THRESHOLD = preferences.getFloat(NVS_DT_START, DT_START_THRESHOLD);
+  DT_STOP_THRESHOLD = preferences.getFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
+  TSUN_MIN_TEMP = preferences.getFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
+  TSUN_OVERHEAT = preferences.getFloat(NVS_TSUN_OVERHEAT, TSUN_OVERHEAT);
+  TSUN_HIGH = preferences.getFloat(NVS_TSUN_HIGH, TSUN_HIGH);
+  MAX_LOSS_STREAK = preferences.getInt(NVS_MAX_LOSS_STREAK, MAX_LOSS_STREAK);
+  
+  // PWM settings
+  PWM_MIN = preferences.getInt(NVS_PWM_MIN, PWM_MIN);
+  PWM_MAX = preferences.getInt(NVS_PWM_MAX, PWM_MAX);
+  PWM_OVERHEAT = preferences.getInt(NVS_PWM_OVERHEAT, PWM_OVERHEAT);
+  
+  // Energy calculation
+  ETMIN = preferences.getFloat(NVS_ETMIN, ETMIN);
+  GLYCOL_PERCENT = preferences.getFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
+  BOILER_VOLUME_TOTAL = preferences.getFloat(NVS_BOILER_VOL, BOILER_VOLUME_TOTAL);
+  
+  // Zone volumes
+  for (int i = 0; i < 5; i++) {
+    String key = String(NVS_ZONE_VOL_BASE) + String(i);
+    ZONE_VOLUMES[i] = preferences.getFloat(key.c_str(), ZONE_VOLUMES[i]);
+  }
+  
+  // Operating hours
+  HOUR_START = preferences.getInt(NVS_HOUR_START, HOUR_START);
+  HOUR_END = preferences.getInt(NVS_HOUR_END, HOUR_END);
+  
+  // Sensor nicknames
+  for (int i = 0; i < 6; i++) {
+    String key = String(NVS_SENSOR_NICK_BASE) + String(i);
+    temp = preferences.getString(key.c_str(), sensor_nicknames[i]);
+    sensor_nicknames[i] = temp;
+  }
+  
+  // Copy thresholds to config struct
+  config.dt_start = DT_START_THRESHOLD;
+  config.dt_stop = DT_STOP_THRESHOLD;
+  config.tsun_min = TSUN_MIN_TEMP;
+  config.tsun_overheat = TSUN_OVERHEAT;
+  config.tsun_high = TSUN_HIGH;
+  config.max_loss_streak = MAX_LOSS_STREAK;
+  config.pwm_min = PWM_MIN;
+  config.pwm_max = PWM_MAX;
+  config.pwm_overheat = PWM_OVERHEAT;
+  config.etmin = ETMIN;
+  config.glycol_percent = GLYCOL_PERCENT;
+  config.boiler_volume = BOILER_VOLUME_TOTAL;
   
   preferences.end();
   
@@ -465,24 +527,60 @@ void loadConfig() {
   Serial.printf("Room ID: %s\n", config.room_id);
   Serial.printf("WiFi SSID: %s\n", strlen(config.wifi_ssid) > 0 ? config.wifi_ssid : "(not configured)");
   Serial.printf("HVAC: %s\n", config.hvac_enabled ? "Enabled" : "Disabled");
+  Serial.printf("Pump thresholds: dT=%.1f/%.1f, Tsun=%.1f-%.1f-%.1f\n", 
+    DT_START_THRESHOLD, DT_STOP_THRESHOLD, TSUN_MIN_TEMP, TSUN_HIGH, TSUN_OVERHEAT);
 }
 
 void saveConfig() {
   preferences.begin(NVS_NAMESPACE, false);
   
+  // System
   preferences.putString(NVS_ROOM_ID, config.room_id);
+  
+  // WiFi
   preferences.putString(NVS_WIFI_SSID, config.wifi_ssid);
   preferences.putString(NVS_WIFI_PASS, config.wifi_pass);
   preferences.putString(NVS_STATIC_IP, config.static_ip);
+  
+  // HVAC integration
   preferences.putString(NVS_HVAC_IP, config.hvac_ip);
   preferences.putString(NVS_HVAC_MDNS, config.hvac_mdns);
   preferences.putBool(NVS_HVAC_ENABLED, config.hvac_enabled);
-  preferences.putFloat(NVS_DT_START, config.dt_start);
-  preferences.putFloat(NVS_DT_STOP, config.dt_stop);
-  preferences.putFloat(NVS_TSUN_MIN, config.tsun_min);
-  preferences.putFloat(NVS_ETMIN, config.etmin);
-  preferences.putFloat(NVS_GLYCOL_PCT, config.glycol_percent);
-  preferences.putFloat(NVS_HVAC_THRESH, config.hvac_threshold);
+  preferences.putFloat(NVS_HVAC_THRESH, HVAC_TRANSFER_THRESHOLD);
+  
+  // Pump thresholds
+  preferences.putFloat(NVS_DT_START, DT_START_THRESHOLD);
+  preferences.putFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
+  preferences.putFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
+  preferences.putFloat(NVS_TSUN_OVERHEAT, TSUN_OVERHEAT);
+  preferences.putFloat(NVS_TSUN_HIGH, TSUN_HIGH);
+  preferences.putInt(NVS_MAX_LOSS_STREAK, MAX_LOSS_STREAK);
+  
+  // PWM settings
+  preferences.putInt(NVS_PWM_MIN, PWM_MIN);
+  preferences.putInt(NVS_PWM_MAX, PWM_MAX);
+  preferences.putInt(NVS_PWM_OVERHEAT, PWM_OVERHEAT);
+  
+  // Energy calculation
+  preferences.putFloat(NVS_ETMIN, ETMIN);
+  preferences.putFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
+  preferences.putFloat(NVS_BOILER_VOL, BOILER_VOLUME_TOTAL);
+  
+  // Zone volumes
+  for (int i = 0; i < 5; i++) {
+    String key = String(NVS_ZONE_VOL_BASE) + String(i);
+    preferences.putFloat(key.c_str(), ZONE_VOLUMES[i]);
+  }
+  
+  // Operating hours
+  preferences.putInt(NVS_HOUR_START, HOUR_START);
+  preferences.putInt(NVS_HOUR_END, HOUR_END);
+  
+  // Sensor nicknames
+  for (int i = 0; i < 6; i++) {
+    String key = String(NVS_SENSOR_NICK_BASE) + String(i);
+    preferences.putString(key.c_str(), sensor_nicknames[i]);
+  }
   
   preferences.end();
   
@@ -585,8 +683,12 @@ void setupWiFi() {
   IPAddress ap_ip = WiFi.softAPIP();
   Serial.printf("AP IP: %s\n", ap_ip.toString().c_str());
   
-  // Captive portal DNS
+  // ✅ CAPTIVE PORTAL DNS (like HVAC!)
   dnsServer.start(53, "*", ap_ip);
+  Serial.println("\n=== CAPTIVE PORTAL ACTIVE ===");
+  Serial.println("AP SSID: ECO-Setup");
+  Serial.println("DNS: Wildcard redirect to settings page");
+  Serial.println("→ Connect and settings will auto-open!");
   
   ap_mode = true;
 }
@@ -1269,88 +1371,137 @@ String getMainPage() {
 // ============================================================================
 // WEB PAGES - Settings Page
 // ============================================================================
+// ============================================================================
+// SETTINGS PAGE - Complete like HVAC V53.4!
+// ============================================================================
 String getSettingsPage() {
+  // Build sensor nicknames HTML
+  String sensorNamesHtml = "";
+  for (int i = 0; i < 6; i++) {
+    sensorNamesHtml += "<label style=\"display:block;margin:6px 0;\">" + sensor_nicknames[i] + ": ";
+    sensorNamesHtml += "<input type=\"text\" name=\"sensor_nick_" + String(i) + "\" value=\"" + sensor_nicknames[i] + "\" style=\"width:220px;\"></label>";
+  }
+  
   String html = R"rawliteral(
 <!DOCTYPE html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings</title>
-  <style>
-    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
-    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
-    .header-left {flex:1;}
-    .header-right {flex:1;text-align:right;font-size:15px;}
-    .container {display:flex;min-height:calc(100vh - 60px);}
-    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
-    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
-    .sidebar a:hover {background:#036;}
-    .sidebar a.active {background:#c00;}
-    .main {flex:1;padding:20px;overflow-y:auto;}
-    h2 {color:#369;border-bottom:2px solid #369;padding-bottom:10px;}
-    table {width:100%;margin:15px 0;}
-    td {padding:10px;}
-    input,select {padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
-    .btn {background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
-    .btn:hover {background:#036;}
-    .warning {background:#ffe6e6;border:2px solid #c00;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#900;}
-    @media (max-width: 600px) {
-      .container {flex-direction:column;}
-      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
-      .sidebar a {width:60px;margin:0 3px;}
-      .main {padding:8px;}
-    }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <div class="header-left">ECO boiler</div>
-    <div class="header-right">Settings</div>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings</title>
+<style>
+body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+.header{display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+.header-left{flex:1;}
+.header-right{flex:1;text-align:right;font-size:15px;}
+.container{display:flex;min-height:calc(100vh - 60px);}
+.sidebar{width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+.sidebar a{display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+.sidebar a:hover{background:#036;}
+.sidebar a.active{background:#c00;}
+.main{flex:1;padding:20px;overflow-y:auto;}
+h2{color:#369;border-bottom:2px solid #369;padding-bottom:10px;}
+.warning{background:#ffe6e6;border:2px solid #c00;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#900;}
+table{width:100%;margin:15px 0;}
+td{padding:10px;}
+input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
+.btn{background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
+.btn:hover{background:#036;}
+@media (max-width: 600px) {
+  .container{flex-direction:column;}
+  .sidebar{width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+  .sidebar a{width:60px;margin:0 3px;}
+  .main{padding:8px;}
+}
+</style></head><body>
+<div class="header">
+  <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral(</div>
+  <div class="header-right">Instellingen</div>
+</div>
+<div class="container">
+  <div class="sidebar">
+    <a href="/">Status</a>
+    <a href="/update">OTA</a>
+    <a href="/json">JSON</a>
+    <a href="/settings" class="active">Settings</a>
   </div>
-  <div class="container">
-    <div class="sidebar">
-      <a href="/">Status</a>
-      <a href="/update">OTA</a>
-      <a href="/json">JSON</a>
-      <a href="/settings" class="active">Settings</a>
-    </div>
-    <div class="main">
-      <div class="warning">⚠️ OPGEPAST: Settings pagina nog in ontwikkeling!<br>Gebruik voorlopig NVS via Serial Monitor.</div>
-      
-      <h2>WiFi Configuratie</h2>
-      <table>
-        <tr><td>Current SSID</td><td>)rawliteral" + String(config.wifi_ssid) + R"rawliteral(</td></tr>
-        <tr><td>Current IP</td><td>)rawliteral" + (ap_mode ? "AP Mode" : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
-      </table>
-      
-      <h2>Pump Settings</h2>
-      <table>
-        <tr><td>dT Start Threshold</td><td>)rawliteral" + String(DT_START_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
-        <tr><td>dT Stop Threshold</td><td>)rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
-        <tr><td>Tsun Minimum</td><td>)rawliteral" + String(TSUN_MIN_TEMP, 1) + R"rawliteral(°C</td></tr>
-      </table>
-      
-      <p style="text-align:center;color:#666;font-style:italic;">
-        Full settings editor coming soon...<br>
-        For now, use Serial commands or factory reset to reconfigure.
-      </p>
-      
-      <div style="text-align:center;">
-        <a href="/" class="btn">← Terug naar Status</a>
-      </div>
-    </div>
+  <div class="main">
+<div class="warning">⚠️ OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
+
+<form action="/save_settings" method="get">
+  
+  <h2>WiFi Configuratie</h2>
+  <table>
+    <tr><td style="width:35%;">WiFi SSID</td><td><input type="text" name="wifi_ssid" value=")rawliteral" + String(config.wifi_ssid) + R"rawliteral("></td></tr>
+    <tr><td>WiFi Password</td><td><input type="password" name="wifi_pass" value=")rawliteral" + String(config.wifi_pass) + R"rawliteral("></td></tr>
+    <tr><td>Static IP</td><td><input type="text" name="static_ip" value=")rawliteral" + String(config.static_ip) + R"rawliteral(" placeholder="leeg = DHCP"></td></tr>
+  </table>
+
+  <h2>Basis Instellingen</h2>
+  <table>
+    <tr><td style="width:35%;">Room naam</td><td><input type="text" name="room_id" value=")rawliteral" + String(config.room_id) + R"rawliteral(" required></td></tr>
+  </table>
+
+  <h2>Pump Thresholds</h2>
+  <table>
+    <tr><td style="width:35%;">dT Start (&deg;C)</td><td><input type="number" step="0.1" name="dt_start" value=")rawliteral" + String(DT_START_THRESHOLD, 1) + R"rawliteral("></td></tr>
+    <tr><td>dT Stop (&deg;C)</td><td><input type="number" step="0.1" name="dt_stop" value=")rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun Minimum (&deg;C)</td><td><input type="number" step="0.1" name="tsun_min" value=")rawliteral" + String(TSUN_MIN_TEMP, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun Overheat (&deg;C)</td><td><input type="number" step="0.1" name="tsun_overheat" value=")rawliteral" + String(TSUN_OVERHEAT, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun High (&deg;C)</td><td><input type="number" step="0.1" name="tsun_high" value=")rawliteral" + String(TSUN_HIGH, 1) + R"rawliteral("></td></tr>
+    <tr><td>Max Loss Streak</td><td><input type="number" name="max_loss_streak" value=")rawliteral" + String(MAX_LOSS_STREAK) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>PWM Settings</h2>
+  <table>
+    <tr><td style="width:35%;">PWM Minimum</td><td><input type="number" name="pwm_min" value=")rawliteral" + String(PWM_MIN) + R"rawliteral("></td></tr>
+    <tr><td>PWM Maximum</td><td><input type="number" name="pwm_max" value=")rawliteral" + String(PWM_MAX) + R"rawliteral("></td></tr>
+    <tr><td>PWM Overheat</td><td><input type="number" name="pwm_overheat" value=")rawliteral" + String(PWM_OVERHEAT) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Energy Calculation</h2>
+  <table>
+    <tr><td style="width:35%;">ETmin (&deg;C)</td><td><input type="number" step="0.1" name="etmin" value=")rawliteral" + String(ETMIN, 1) + R"rawliteral("></td></tr>
+    <tr><td>Glycol % (0-50)</td><td><input type="number" step="1" name="glycol_pct" value=")rawliteral" + String(GLYCOL_PERCENT, 0) + R"rawliteral("></td></tr>
+    <tr><td>Total Volume (L)</td><td><input type="number" step="1" name="boiler_volume" value=")rawliteral" + String(BOILER_VOLUME_TOTAL, 0) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Zone Volumes (Liters)</h2>
+  <table>
+    <tr><td style="width:35%;">Zone 1 (Top)</td><td><input type="number" step="1" name="zone_vol_0" value=")rawliteral" + String(ZONE_VOLUMES[0], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 2</td><td><input type="number" step="1" name="zone_vol_1" value=")rawliteral" + String(ZONE_VOLUMES[1], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 3</td><td><input type="number" step="1" name="zone_vol_2" value=")rawliteral" + String(ZONE_VOLUMES[2], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 4</td><td><input type="number" step="1" name="zone_vol_3" value=")rawliteral" + String(ZONE_VOLUMES[3], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 5 (Bottom)</td><td><input type="number" step="1" name="zone_vol_4" value=")rawliteral" + String(ZONE_VOLUMES[4], 0) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>HVAC Integration</h2>
+  <table>
+    <tr><td style="width:35%;">HVAC Enabled</td><td><input type="checkbox" name="hvac_enabled" value="1"" + String(config.hvac_enabled ? " checked" : "") + R"rawliteral(></td></tr>
+    <tr><td>HVAC IP adres</td><td><input type="text" name="hvac_ip" value=")rawliteral" + String(config.hvac_ip) + R"rawliteral("></td></tr>
+    <tr><td>HVAC mDNS naam</td><td><input type="text" name="hvac_mdns" value=")rawliteral" + String(config.hvac_mdns) + R"rawliteral(" placeholder="ZONDER .local"></td></tr>
+    <tr><td>Transfer Threshold (kWh)</td><td><input type="number" step="0.1" name="hvac_thresh" value=")rawliteral" + String(HVAC_TRANSFER_THRESHOLD, 1) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Operating Hours</h2>
+  <table>
+    <tr><td style="width:35%;">Start Hour</td><td><input type="number" min="0" max="23" name="hour_start" value=")rawliteral" + String(HOUR_START) + R"rawliteral("></td></tr>
+    <tr><td>End Hour</td><td><input type="number" min="0" max="23" name="hour_end" value=")rawliteral" + String(HOUR_END) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Sensor Nicknames</h2>
+  <div style="padding:10px;">)rawliteral" + sensorNamesHtml + R"rawliteral(</div>
+
+  <div style="text-align:center;">
+    <button type="submit" class="btn">💾 Opslaan & Reboot</button>
+    <a href="/" class="btn" style="display:inline-block;text-decoration:none;background:#c00;">❌ Annuleren</a>
   </div>
-</body>
-</html>
+</form>
+</div></div>
+</body></html>
 )rawliteral";
   
   return html;
 }
 
-// ============================================================================
-// WEB PAGES - Manual Control Page
-// ============================================================================
+
 String getManualPage() {
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -1412,6 +1563,19 @@ String getManualPage() {
 // WEB SERVER SETUP & ENDPOINTS
 // ============================================================================
 void setupWebServer() {
+  // ============================================================================
+  // CAPTIVE PORTAL - Like HVAC V53.4!
+  // ============================================================================
+  // Redirect all unknown requests to /settings in AP mode
+  server.onNotFound([](AsyncWebServerRequest *request){
+    if (ap_mode) {
+      Serial.printf("Captive portal: Redirecting %s to /settings\n", request->url().c_str());
+      request->redirect("/settings");
+    } else {
+      request->send(404, "text/plain", "Not found");
+    }
+  });
+  
   // Main page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", getMainPage());
@@ -1571,6 +1735,146 @@ void setupWebServer() {
     if (final && Update.end(true)) Serial.println("OTA OK");
   });
   
+  // Save settings endpoint
+  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("\n=== SAVE SETTINGS ===");
+    
+    // WiFi
+    if (request->hasArg("wifi_ssid")) {
+      strncpy(config.wifi_ssid, request->arg("wifi_ssid").c_str(), sizeof(config.wifi_ssid) - 1);
+      Serial.printf("WiFi SSID: %s\n", config.wifi_ssid);
+    }
+    if (request->hasArg("wifi_pass")) {
+      strncpy(config.wifi_pass, request->arg("wifi_pass").c_str(), sizeof(config.wifi_pass) - 1);
+      Serial.println("WiFi Password: ***");
+    }
+    if (request->hasArg("static_ip")) {
+      strncpy(config.static_ip, request->arg("static_ip").c_str(), sizeof(config.static_ip) - 1);
+      Serial.printf("Static IP: %s\n", config.static_ip);
+    }
+    
+    // System
+    if (request->hasArg("room_id")) {
+      strncpy(config.room_id, request->arg("room_id").c_str(), sizeof(config.room_id) - 1);
+      Serial.printf("Room ID: %s\n", config.room_id);
+    }
+    
+    // Pump thresholds
+    if (request->hasArg("dt_start")) {
+      DT_START_THRESHOLD = request->arg("dt_start").toFloat();
+      Serial.printf("dT Start: %.1f\n", DT_START_THRESHOLD);
+    }
+    if (request->hasArg("dt_stop")) {
+      DT_STOP_THRESHOLD = request->arg("dt_stop").toFloat();
+      Serial.printf("dT Stop: %.1f\n", DT_STOP_THRESHOLD);
+    }
+    if (request->hasArg("tsun_min")) {
+      TSUN_MIN_TEMP = request->arg("tsun_min").toFloat();
+      Serial.printf("Tsun Min: %.1f\n", TSUN_MIN_TEMP);
+    }
+    if (request->hasArg("tsun_overheat")) {
+      TSUN_OVERHEAT = request->arg("tsun_overheat").toFloat();
+      Serial.printf("Tsun Overheat: %.1f\n", TSUN_OVERHEAT);
+    }
+    if (request->hasArg("tsun_high")) {
+      TSUN_HIGH = request->arg("tsun_high").toFloat();
+      Serial.printf("Tsun High: %.1f\n", TSUN_HIGH);
+    }
+    if (request->hasArg("max_loss_streak")) {
+      MAX_LOSS_STREAK = request->arg("max_loss_streak").toInt();
+      Serial.printf("Max Loss Streak: %d\n", MAX_LOSS_STREAK);
+    }
+    
+    // PWM settings
+    if (request->hasArg("pwm_min")) {
+      PWM_MIN = request->arg("pwm_min").toInt();
+      Serial.printf("PWM Min: %d\n", PWM_MIN);
+    }
+    if (request->hasArg("pwm_max")) {
+      PWM_MAX = request->arg("pwm_max").toInt();
+      Serial.printf("PWM Max: %d\n", PWM_MAX);
+    }
+    if (request->hasArg("pwm_overheat")) {
+      PWM_OVERHEAT = request->arg("pwm_overheat").toInt();
+      Serial.printf("PWM Overheat: %d\n", PWM_OVERHEAT);
+    }
+    
+    // Energy calculation
+    if (request->hasArg("etmin")) {
+      ETMIN = request->arg("etmin").toFloat();
+      Serial.printf("ETmin: %.1f\n", ETMIN);
+    }
+    if (request->hasArg("glycol_pct")) {
+      GLYCOL_PERCENT = request->arg("glycol_pct").toFloat();
+      Serial.printf("Glycol %%: %.0f\n", GLYCOL_PERCENT);
+    }
+    if (request->hasArg("boiler_volume")) {
+      BOILER_VOLUME_TOTAL = request->arg("boiler_volume").toFloat();
+      Serial.printf("Boiler Volume: %.0f L\n", BOILER_VOLUME_TOTAL);
+    }
+    
+    // Zone volumes
+    for (int i = 0; i < 5; i++) {
+      String param = "zone_vol_" + String(i);
+      if (request->hasArg(param.c_str())) {
+        ZONE_VOLUMES[i] = request->arg(param.c_str()).toFloat();
+        Serial.printf("Zone %d Volume: %.0f L\n", i+1, ZONE_VOLUMES[i]);
+      }
+    }
+    
+    // HVAC integration
+    config.hvac_enabled = request->hasArg("hvac_enabled");
+    Serial.printf("HVAC Enabled: %s\n", config.hvac_enabled ? "Yes" : "No");
+    
+    if (request->hasArg("hvac_ip")) {
+      strncpy(config.hvac_ip, request->arg("hvac_ip").c_str(), sizeof(config.hvac_ip) - 1);
+      Serial.printf("HVAC IP: %s\n", config.hvac_ip);
+    }
+    if (request->hasArg("hvac_mdns")) {
+      String mdns = request->arg("hvac_mdns");
+      mdns.replace(".local", "");
+      mdns.trim();
+      strncpy(config.hvac_mdns, mdns.c_str(), sizeof(config.hvac_mdns) - 1);
+      Serial.printf("HVAC mDNS: %s\n", config.hvac_mdns);
+    }
+    if (request->hasArg("hvac_thresh")) {
+      HVAC_TRANSFER_THRESHOLD = request->arg("hvac_thresh").toFloat();
+      Serial.printf("HVAC Threshold: %.1f kWh\n", HVAC_TRANSFER_THRESHOLD);
+    }
+    
+    // Operating hours
+    if (request->hasArg("hour_start")) {
+      HOUR_START = request->arg("hour_start").toInt();
+      Serial.printf("Hour Start: %d\n", HOUR_START);
+    }
+    if (request->hasArg("hour_end")) {
+      HOUR_END = request->arg("hour_end").toInt();
+      Serial.printf("Hour End: %d\n", HOUR_END);
+    }
+    
+    // Sensor nicknames
+    for (int i = 0; i < 6; i++) {
+      String param = "sensor_nick_" + String(i);
+      if (request->hasArg(param.c_str())) {
+        String nick = request->arg(param.c_str());
+        nick.trim();
+        if (nick.length() > 0 && nick.length() < 50) {
+          sensor_nicknames[i] = nick;
+          Serial.printf("Sensor %d: %s\n", i+1, nick.c_str());
+        }
+      }
+    }
+    
+    // Save to NVS
+    saveConfig();
+    
+    Serial.println("All settings saved to NVS!");
+    request->send(200, "text/html", "<h2 style='text-align:center;color:#369;'>✅ Opgeslagen! Rebooting in 2 seconds...</h2>");
+    delay(2000);
+    ESP.restart();
+  });
+
+
   server.begin();
   Serial.println("Web server started");
 }
