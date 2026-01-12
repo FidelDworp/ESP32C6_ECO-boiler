@@ -647,19 +647,36 @@ void setupWiFi() {
       }
     }
     
-    WiFi.begin(config.wifi_ssid, config.wifi_pass);
+    // HVAC-style retry logic: 5 attempts @ 20s each
+    int retry_count = 0;
+    const int MAX_RETRIES = 5;
+    bool connected = false;
     
-    // Wait up to 20s
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
+    while (!connected && retry_count < MAX_RETRIES) {
+      WiFi.begin(config.wifi_ssid, config.wifi_pass);
+      
+      unsigned long start_attempt = millis();
+      while (WiFi.status() != WL_CONNECTED && (millis() - start_attempt) < 20000) {
+        delay(500);
+        Serial.print(".");
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        Serial.println("\n✓ WiFi connected!");
+      } else {
+        retry_count++;
+        Serial.printf("\n✗ Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
+        
+        if (retry_count < MAX_RETRIES) {
+          Serial.println("Disconnecting and retrying...");
+          WiFi.disconnect();
+          delay(2000);
+        }
+      }
     }
-    Serial.println();
     
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("✓ WiFi connected!");
+    if (connected) {
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
       
@@ -670,6 +687,8 @@ void setupWiFi() {
       
       ap_mode = false;
       return;
+    } else {
+      Serial.println("\n✗ All WiFi attempts failed -> AP mode");
     }
   }
   
@@ -1305,12 +1324,12 @@ String getMainPage() {
         <div class="section-title">🌡️ BOILER TEMPERATUREN</div>
         <table>
           <tr class="header-row"><td>Zone</td><td>Temperatuur</td></tr>
-          <tr><td class="label">ETopH (Top High)</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">ETopL (Top Low)</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">EMidH (Mid High)</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">EMidL (Mid Low)</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">EBotH (Bottom High)</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">EBotL (Bottom Low)</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[0] + R"rawliteral(</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[1] + R"rawliteral(</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[2] + R"rawliteral(</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[3] + R"rawliteral(</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[4] + R"rawliteral(</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[5] + R"rawliteral(</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
         </table>
       </div>
       
