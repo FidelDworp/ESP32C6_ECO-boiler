@@ -9,26 +9,14 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
- Version 1.2 (12 jan 2026 @ 22:30)
+Version 1.3 (12 jan 2026 @ 09:50) Features Summary:
+ * 1. Temperature scale gauge (-10°C to 120°C with color zones)
+ * 2. Live charts (60-minute data for temps, energy, pump)
+ * 3. Trend indicators (↑↓→) on all metrics
+ * 4. Smart pump status messages (context-aware!)
 
- * Changes from V1.1:
- * - Complete settings page (like HVAC V53.4)
- * - Captive portal for AP mode setup
- * - All parameters configurable via web
- * - NVS storage for all settings
- * - Improved WiFi stability
- * 
- * Previous changes (V1.1):
- * - Optimized pin layout for RJ45 shield
- * - HVAC V53.4 style UI (sidebar navigation)
- * - Pump override buttons (60s timer)
- * - All 6 boiler temps displayed
- * - System info (IP, mDNS)
- * - Fixed ledcAttach() for ESP32 core 3.x
-
-Opm: SIMULATION MODE (Voor testen!)
-**Enable in sketch** (regel ~44):
-#define SIMULATION_MODE true  // Set to false for real sensors
+Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
+Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
 - Generates fake realistic data
 - Sun cycle simulation (25-65°C daytime)
 - Stratified boiler temps
@@ -56,7 +44,7 @@ Opm: SIMULATION MODE (Voor testen!)
 
 // ============== PIN DEFINITIONS ==============
 // SIMULATION MODE - Set to true for testing without sensors
-#define SIMULATION_MODE false  // Set to true for testing on breadboard
+#define SIMULATION_MODE true  // Set to true for testing on breadboard
 
 // 1-Wire pin (DS18B20 boiler sensors) - RJ45 Connector 1
 #define ONEWIRE_PIN  3
@@ -1170,9 +1158,53 @@ String getFormattedDateTime() {
  * ============================================================================ */
 
 // ============================================================================
+// UI V3 HELPER FUNCTIONS
+// ============================================================================
+
+// Calculate trend (↑↓→)
+String getTrend(float current, float previous, float threshold = 0.1) {
+  if (abs(current - previous) < threshold) return "→";
+  return (current > previous) ? "↑" : "↓";
+}
+
+// Smart pump status message
+String getPumpMessage() {
+  time_t now; struct tm tm; time(&now); localtime_r(&now, &tm); int h = tm.tm_hour;
+  
+  if (pump_override_active) return pump_override_state ? "🎮 Handmatig: Pomp AAN" : "🎮 Handmatig: Pomp UIT";
+  if (Tsun >= TSUN_OVERHEAT) return "🚨 OVERVERHITTING - Noodkoeling!";
+  if (h < HOUR_START || h >= HOUR_END) return "🌙 Nacht - systeem rust";
+  
+  if (pump_relay) {
+    if (Tsun > TSUN_HIGH && dT > (DT_START_THRESHOLD + 5)) return "☀️ Hoge energie productie! Volle zon!";
+    if (Tsun > (TSUN_OVERHEAT - 5)) return "⚠️ Preventieve koeling - Collector heet!";
+    if (dT > DT_START_THRESHOLD && Tsun > 40) return "✅ Optimaal laden van boiler";
+    if (pwm_value > 150) return "🔄 Energie transport - Hoge snelheid";
+    return "🔄 Energie transport actief";
+  } else {
+    if (dEQ < -0.3 && EQtot > 5) return "💧 Warm water verbruik - Er wordt gedoucht!";
+    if (consecutive_reductions >= MAX_LOSS_STREAK) return "⏸️ Verliesstreek - Pomp gestopt";
+    if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) return "🛡️ Thermosiphon preventie actief";
+    if (dT < DT_START_THRESHOLD && Tsun > 30) return "⏳ Te weinig verschil - Wachten op meer dT";
+    if (h >= HOUR_START && h < 10 && Tsun < 30) return "🌅 Collector aan het opwarmen...";
+    if (h >= 18 && h < HOUR_END && Tsun < 40) return "🌇 Zon gaat onder - Productie daalt";
+    if (Tsun < 25) return "☁️ Wachten op zon!";
+    return "⏳ Wachten op betere omstandigheden";
+  }
+}
+
+// ============================================================================
 // WEB PAGES - Main Status Page
 // ============================================================================
 String getMainPage() {
+  // Calculate trends (vs 5 min ago)
+  int prev = (graph_data.index - 5 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
+  String tTsun = getTrend(Tsun, graph_data.tsun[prev], 0.5);
+  String tTboil = getTrend(Tboil, graph_data.tboil[prev], 0.5);
+  String tDT = getTrend(dT, graph_data.dt[prev], 0.3);
+  String tEQ = getTrend(EQtot, graph_data.eqtot[prev], 0.05);
+  String msg = getPumpMessage();
+  
   String html;
   html.reserve(50000);
   
@@ -1216,6 +1248,19 @@ String getMainPage() {
     .pump-on {background:#0a0;color:#fff;}
     .pump-off {background:#999;color:#fff;}
     .status-text {font-size:12px;color:#666;font-style:italic;margin-top:5px;}
+    
+    /* V3 ENHANCEMENTS */
+    .temp-scale {width:100%;height:60px;position:relative;margin:15px 0;}
+    .temp-scale-bar {width:100%;height:30px;background:linear-gradient(90deg,#0af 0%,#0af 23%,#0f0 23%,#0f0 46%,#fa0 46%,#fa0 69%,#f00 69%,#f00 92%,#a00 92%);border-radius:5px;position:relative;}
+    .temp-scale-labels {display:flex;justify-content:space-between;font-size:11px;color:#666;margin-top:5px;}
+    .temp-marker {position:absolute;top:-10px;width:3px;height:50px;background:#000;box-shadow:0 0 5px rgba(0,0,0,0.5);}
+    .temp-marker::after {content:'▼';position:absolute;top:-15px;left:-7px;font-size:16px;color:#000;}
+    .temp-value {position:absolute;top:32px;left:50%;transform:translateX(-50%);background:#000;color:#fff;padding:2px 8px;border-radius:3px;font-size:13px;font-weight:bold;white-space:nowrap;}
+    .trend {font-size:18px;margin-left:5px;color:#369;}
+    .smart-status {background:#e6f0ff;border-left:4px solid #369;padding:10px 15px;margin:10px 0;font-size:14px;font-weight:bold;color:#369;border-radius:4px;}
+    .chart-box {background:#fff;padding:10px;border-radius:8px;border:1px solid #ddd;margin:15px 0;}
+    canvas {width:100%!important;height:200px!important;}
+    
     @media (max-width: 600px) {
       .container {flex-direction:column;}
       .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
@@ -1223,6 +1268,7 @@ String getMainPage() {
       .main {padding:8px;}
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <div class="header">
@@ -1238,21 +1284,31 @@ String getMainPage() {
     </div>
     <div class="main">
       
-      <!-- Collector Temperature -->
+      <!-- Collector Temperature with SCALE -->
       <div class="section">
-        <div class="section-title">☀️ COLLECTOR (Dak)</div>
-        <div class="gauge">
-          <div class="gauge-fill" style="width:)rawliteral" + String(constrain(Tsun, 0, 100)) + R"rawliteral(%;"></div>
-          <div class="gauge-label">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
+        <div class="section-title">☀️ COLLECTOR (Dak) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></div>
+        <div class="temp-scale">
+          <div class="temp-scale-bar">
+            <div class="temp-marker" style="left:)rawliteral" + String(constrain((Tsun + 10) * 100.0 / 130.0, 0, 100)) + R"rawliteral(%;">
+              <div class="temp-value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
+            </div>
+          </div>
+          <div class="temp-scale-labels">
+            <span>-10°C<br>❄️ IJskoud</span>
+            <span>20°C<br>☁️ Koud</span>
+            <span>50°C<br>☀️ Warm</span>
+            <span>80°C<br>🔥 Heet</span>
+            <span>120°C<br>🚨 Gevaar</span>
+          </div>
         </div>
       </div>
       
       <!-- Temperature Differential -->
       <div class="section">
-        <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT)</div>
+        <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT) <span class="trend">)rawliteral" + tDT + R"rawliteral(</span></div>
         <table>
-          <tr><td class="label">Collector (Tsun)</td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
-          <tr><td class="label">Boiler input (Tboil)</td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Collector (Tsun) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Boiler input (Tboil) <span class="trend">)rawliteral" + tTboil + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
           <tr><td class="label">Verschil (dT)</td><td class="value" style="font-size:18px;color:)rawliteral" + 
             String(dT > DT_START_THRESHOLD ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dT, 1) + R"rawliteral(°C</td></tr>
           <tr><td class="label">Threshold</td><td class="value">Start: )rawliteral" + String(DT_START_THRESHOLD, 1) + 
@@ -1263,6 +1319,7 @@ String getMainPage() {
       <!-- Pump Status with Override Controls -->
       <div class="section">
         <div class="section-title">💨 POMP STATUS</div>
+        <div class="smart-status">)rawliteral" + msg + R"rawliteral(</div>
         <div style="text-align:center;">
           <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
             )rawliteral" + String(pump_relay ? "●  AAN" : "○  UIT") + R"rawliteral(
@@ -1305,7 +1362,7 @@ String getMainPage() {
       
       <!-- Boiler Energy -->
       <div class="section">
-        <div class="section-title">🔋 BOILER ENERGIE</div>
+        <div class="section-title">🔋 BOILER ENERGIE <span class="trend">)rawliteral" + tEQ + R"rawliteral(</span></div>
         <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
           String(EQtot, 2) + R"rawliteral( kWh</div>
         <div class="gauge">
@@ -1333,6 +1390,17 @@ String getMainPage() {
         </table>
       </div>
       
+      <!-- Live Charts -->
+      <div class="section">
+        <div class="section-title">📊 LIVE GRAFIEKEN (60 minuten)</div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Temperaturen</h3>
+        <div class="chart-box"><canvas id="tempChart"></canvas></div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Energie</h3>
+        <div class="chart-box"><canvas id="energyChart"></canvas></div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Pomp</h3>
+        <div class="chart-box"><canvas id="pumpChart"></canvas></div>
+      </div>
+      
       <!-- System Status -->
       <div class="section">
         <div class="section-title">⚙️ SYSTEEM</div>
@@ -1357,6 +1425,30 @@ String getMainPage() {
       const endpoint = state ? '/pump_override_on' : '/pump_override_off';
       fetch(endpoint).then(() => setTimeout(() => location.reload(), 500));
     }
+    
+    // Render charts
+    fetch('/graph_data').then(r => r.json()).then(d => {
+      const labels = Array.from({length: 60}, (_, i) => `-${60-i}m`);
+      new Chart(document.getElementById('tempChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [
+          {label: 'Tsun', data: d.tsun, borderColor: '#f90', tension: 0.3},
+          {label: 'Tboil', data: d.tboil, borderColor: '#36f', tension: 0.3},
+          {label: 'dT', data: d.dt, borderColor: '#0a0', tension: 0.3}
+        ]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {title: {display: true, text: '°C'}}}}
+      });
+      new Chart(document.getElementById('energyChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [{label: 'EQtot', data: d.eqtot, borderColor: '#c00', tension: 0.3}]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {title: {display: true, text: 'kWh'}}}}
+      });
+      new Chart(document.getElementById('pumpChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [{label: 'PWM', data: d.pwm, borderColor: '#369', stepped: true, fill: true}]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {min: 0, max: 255, title: {display: true, text: 'PWM'}}}}
+      });
+    }).catch(e => console.error('Chart:', e));
     
     function cancelPumpOverride() {
       fetch('/pump_override_cancel').then(() => setTimeout(() => location.reload(), 500));
