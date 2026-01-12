@@ -9,11 +9,16 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
-Version 1.3 (12 jan 2026 @ 09:50) Features Summary:
- * 1. Temperature scale gauge (-10°C to 120°C with color zones)
- * 2. Live charts (60-minute data for temps, energy, pump)
- * 3. Trend indicators (↑↓→) on all metrics
- * 4. Smart pump status messages (context-aware!)
+Version 1.3 (12 jan 2026 @ 10:30) Features Summary:
+✅ Temperature scale gauge (-10°C → 120°C)
+✅ Live charts (3× grafieken, 60 min data)
+✅ Trend indicators (↑↓→)
+✅ Smart pump status messages (20+ variants)
+✅ Yield today counter (FIXED!)
+✅ Uptime hours + minutes (FIXED!)
+✅ Simulation mode in settings (COMPLETE!)
+✅ Pump status in JSON (COMPLETE!)
+✅ RED warnings everywhere when sim mode active
 
 Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
 Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
@@ -44,7 +49,8 @@ Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for 
 
 // ============== PIN DEFINITIONS ==============
 // SIMULATION MODE - Set to true for testing without sensors
-#define SIMULATION_MODE true  // Set to true for testing on breadboard
+// ============== SIMULATION MODE ==============
+bool SIMULATION_MODE = false;  // Can be changed via settings (DANGEROUS!)
 
 // 1-Wire pin (DS18B20 boiler sensors) - RJ45 Connector 1
 #define ONEWIRE_PIN  3
@@ -244,6 +250,8 @@ struct GraphData {
 #define NVS_HVAC_THRESH "hvac_thresh"
 // Sensor nicknames
 #define NVS_SENSOR_NICK_BASE "sensor_"
+// Simulation
+#define NVS_SIMULATION_MODE "sim_mode"
 
 // ============== FUNCTION DECLARATIONS ==============
 void loadConfig();
@@ -348,7 +356,12 @@ void loop() {
     prev_EQtot = EQtot;
     last_deq_calc = millis();
     
-    Serial.printf("dEQ: %.3f kWh/10min\n", dEQ);
+    // Update daily yield (only positive gains!)
+    if (dEQ > 0) {
+      yield_today += dEQ;
+    }
+    
+    Serial.printf("dEQ: %.3f kWh/10min (Yield today: %.1f kWh)\n", dEQ, yield_today);
   }
   
   // Check pump logic (every 60s)
@@ -509,12 +522,24 @@ void loadConfig() {
   config.glycol_percent = GLYCOL_PERCENT;
   config.boiler_volume = BOILER_VOLUME_TOTAL;
   
+  // Simulation mode
+  SIMULATION_MODE = preferences.getBool(NVS_SIMULATION_MODE, false);
+  
   preferences.end();
   
   Serial.println("Configuration loaded from NVS");
   Serial.printf("Room ID: %s\n", config.room_id);
   Serial.printf("WiFi SSID: %s\n", strlen(config.wifi_ssid) > 0 ? config.wifi_ssid : "(not configured)");
   Serial.printf("HVAC: %s\n", config.hvac_enabled ? "Enabled" : "Disabled");
+  
+  // SIMULATION MODE WARNING
+  if (SIMULATION_MODE) {
+    Serial.println("\n⚠️⚠️⚠️ WARNING ⚠️⚠️⚠️");
+    Serial.println("SIMULATION MODE ACTIVE!");
+    Serial.println("Using FAKE sensor data!");
+    Serial.println("⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️\n");
+  }
+  
   Serial.printf("Pump thresholds: dT=%.1f/%.1f, Tsun=%.1f-%.1f-%.1f\n", 
     DT_START_THRESHOLD, DT_STOP_THRESHOLD, TSUN_MIN_TEMP, TSUN_HIGH, TSUN_OVERHEAT);
 }
@@ -569,6 +594,9 @@ void saveConfig() {
     String key = String(NVS_SENSOR_NICK_BASE) + String(i);
     preferences.putString(key.c_str(), sensor_nicknames[i]);
   }
+  
+  // Simulation mode
+  preferences.putBool(NVS_SIMULATION_MODE, SIMULATION_MODE);
   
   preferences.end();
   
@@ -1283,6 +1311,18 @@ String getMainPage() {
       <a href="/settings">Settings</a>
     </div>
     <div class="main">
+      )rawliteral";
+  
+  // RED WARNING if simulation mode
+  if (SIMULATION_MODE) {
+    html += R"rawliteral(
+      <div style="background:#c00;color:#fff;padding:15px;margin:0 0 15px 0;border-radius:8px;text-align:center;font-weight:bold;font-size:18px;">
+        ⚠️⚠️⚠️ SIMULATION MODE ACTIEF - FAKE DATA! ⚠️⚠️⚠️
+      </div>
+    )rawliteral";
+  }
+  
+  html += R"rawliteral(
       
       <!-- Collector Temperature with SCALE -->
       <div class="section">
@@ -1409,7 +1449,7 @@ String getMainPage() {
           <tr><td class="label">mDNS naam</td><td class="value">http://)rawliteral" + String(config.room_id) + R"rawliteral(.local</td></tr>
           <tr><td class="label">WiFi RSSI</td><td class="value">)rawliteral" + String(wifi_rssi) + R"rawliteral( dBm</td></tr>
           <tr><td class="label">Free heap</td><td class="value">)rawliteral" + String((ESP.getFreeHeap() * 100) / ESP.getHeapSize()) + R"rawliteral(%</td></tr>
-          <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral( uur</td></tr>
+          <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral(u )rawliteral" + String((uptime_sec % 3600) / 60) + R"rawliteral(m</td></tr>
         </table>
       </div>
       
@@ -1597,6 +1637,17 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
     <tr><td>End Hour</td><td><input type="number" min="0" max="23" name="hour_end" value=")rawliteral" + String(HOUR_END) + R"rawliteral("></td></tr>
   </table>
 
+  <h2 style="color:#c00;">⚠️ SIMULATION MODE (GEVAARLIJK!)</h2>
+  <div style="background:#ffe6e6;border:3px solid #c00;padding:20px;margin:15px 0;border-radius:8px;">
+    <p style="color:#c00;font-weight:bold;font-size:16px;margin:0 0 10px 0;">⚠️ WAARSCHUWING: ALLEEN VOOR TESTING!</p>
+    <p style="margin:0 0 10px 0;">Simulation mode gebruikt NEP sensor data. <strong>NOOIT gebruiken in productie!</strong></p>
+    <label style="display:block;margin:10px 0;">
+      <input type="checkbox" name="simulation_mode" value="1"" + String(SIMULATION_MODE ? " checked" : "") + R"rawliteral( style="width:auto;">
+      <strong style="color:#c00;">JA, ik wil simulation mode activeren (FAKE data!)</strong>
+    </label>
+    <p style="font-size:12px;color:#666;margin:10px 0 0 0;">Als dit aangevinkt is, worden ALLE sensors genegeerd en gebruikt het systeem nep temperaturen!</p>
+  </div>
+
   <h2>Sensor Nicknames</h2>
   <div style="padding:10px;">)rawliteral" + sensorNamesHtml + R"rawliteral(</div>
 
@@ -1709,17 +1760,22 @@ void setupWebServer() {
   
   // JSON endpoint (Google Docs compatible - Photon format with uptime first!)
   server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
-    char json[400];
+    String pumpMsg = getPumpMessage();
+    pumpMsg.replace("\"", "\\\"");  // Escape quotes for JSON
+    
+    char json[600];
     snprintf(json, sizeof(json), 
       "{\"uptime\":%lu,"
       "\"ETopH\":%.1f,\"ETopL\":%.1f,\"EMidH\":%.1f,\"EMidL\":%.1f,"
       "\"EBotH\":%.1f,\"EBotL\":%.1f,\"EAv\":%.1f,\"EQtot\":%.2f,"
       "\"Solar\":%.1f,\"dT\":%.1f,\"dEQ\":%.3f,\"pwmVal\":%d,"
-      "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d}",
+      "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d,"
+      "\"pump_status\":\"%s\",\"yield_today\":%.1f}",
       uptime_sec,
       ETopH, ETopL, EMidH, EMidL, EBotH, EBotL, EAv, EQtot,
       Tsun, dT, dEQ, pwm_value,
-      pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize()
+      pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize(),
+      pumpMsg.c_str(), yield_today
     );
     request->send(200, "application/json", json);
   });
@@ -1974,6 +2030,14 @@ void setupWebServer() {
           Serial.printf("Sensor %d: %s\n", i+1, nick.c_str());
         }
       }
+    }
+    
+    // Simulation mode (checkbox)
+    SIMULATION_MODE = request->hasArg("simulation_mode");
+    if (SIMULATION_MODE) {
+      Serial.println("⚠️ SIMULATION MODE ENABLED!");
+    } else {
+      Serial.println("Simulation mode DISABLED");
     }
     
     // Save to NVS
