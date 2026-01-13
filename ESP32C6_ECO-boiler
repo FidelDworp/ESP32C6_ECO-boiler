@@ -9,7 +9,7 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
-Version 1.3 (12 jan 2026 @ 11:30) Features Summary:
+Version 1.3 (12 jan 2026 @ 11:0) Features Summary:
 ✅ Temperature scale gauge (-10°C → 120°C met kleuren)
 ✅ Live charts (3× grafieken, 60 min data)
 ✅ Trend indicators (↑↓→) overal
@@ -19,6 +19,8 @@ Version 1.3 (12 jan 2026 @ 11:30) Features Summary:
 ✅ Simulation mode in settings (FIXED!)
 ✅ Pump status in JSON (NIEUW!)
 ✅ Rode waarschuwingen bij simulation mode
+
+Version 1.4 (13 jan 2026 @ 21:58) Mac address toevoegen in UI: Om static IP te kunnen registreren in router
 
 Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
 Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
@@ -140,6 +142,9 @@ struct Config {
   float boiler_volume;
   float hvac_threshold;
 } config;
+
+// Global MAC address (voor display in settings)
+String mac_address = "";
 
 // Sensor nicknames (global)
 String sensor_nicknames[6] = {
@@ -668,10 +673,19 @@ void setupWiFi() {
     const int MAX_RETRIES = 5;
     bool connected = false;
     
+
     while (!connected && retry_count < MAX_RETRIES) {
-      WiFi.begin(config.wifi_ssid, config.wifi_pass);
-      
-      unsigned long start_attempt = millis();
+    WiFi.begin(config.wifi_ssid, config.wifi_pass);
+    
+    // Haal MAC op NA eerste WiFi.begin
+    if (retry_count == 0) {
+      mac_address = WiFi.macAddress();
+      Serial.println("MAC adres: " + mac_address);
+    }
+    
+    unsigned long start_attempt = millis();
+
+
       while (WiFi.status() != WL_CONNECTED && (millis() - start_attempt) < 20000) {
         delay(500);
         Serial.print(".");
@@ -1575,6 +1589,28 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
   </div>
   <div class="main">
 <div class="warning">⚠️ OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
+
+
+<!-- MAC ADRES BOX -->
+<div style="background:#e6f0ff;border:3px solid #336699;padding:20px;margin:20px;border-radius:8px;text-align:center;">
+  <h3 style="margin:0 0 10px 0;color:#336699;">📡 Controller MAC Adres</h3>
+  <div style="font-size:20px;font-weight:bold;color:#003366;font-family:monospace;background:#fff;padding:10px;border-radius:4px;display:inline-block;margin:10px 0;border:2px solid #336699;">)rawliteral" + mac_address + R"rawliteral(</div>
+  <div style="font-size:13px;color:#666;margin-top:10px;">💡 Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
+</div>
+
+<!-- AANBEVOLEN CONFIGURATIE -->
+<div style="background:#fffacd;border:2px solid #336699;padding:15px;margin:20px;border-radius:8px;font-size:14px;">
+  <h4 style="margin:0 0 10px 0;color:#336699;">✅ Aanbevolen: DHCP met MAC-reservering</h4>
+  <ol style="margin:10px 0;padding-left:25px;line-height:1.6;">
+    <li>Kopieer het MAC-adres hierboven</li>
+    <li>Log in op je router (meestal 192.168.1.1)</li>
+    <li>Ga naar: LAN → DHCP Server → Manual Assignment</li>
+    <li>Voeg toe: MAC-adres + gewenst IP (bijv. 192.168.1.102)</li>
+    <li>Laat hieronder het "Static IP" veld <strong>LEEG</strong></li>
+    <li>Sla op en reboot deze controller</li>
+  </ol>
+</div>
+
 
 <form action="/save_settings" method="get">
   
