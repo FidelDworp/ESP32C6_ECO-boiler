@@ -21,6 +21,7 @@ Version 1.3 (12 jan 2026 @ 11:0) Features Summary:
 ✅ Rode waarschuwingen bij simulation mode
 
 Version 1.4 (13 jan 2026 @ 21:58) Mac address toevoegen in UI: Om static IP te kunnen registreren in router
+Version 1.5 (14 jan 2026 @ 23:09) Sleep mode voor ESP32 C6 uitgeschakeld: Betere bereikbaarheid (ping < 10ms)
 
 Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
 Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
@@ -41,6 +42,7 @@ Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for 
 #include <HTTPClient.h>
 #include <Update.h>
 #include <time.h>
+#include <esp_wifi.h>
 
 // SPI for MAX31865
 #include <SPI.h>
@@ -691,11 +693,21 @@ void setupWiFi() {
         Serial.print(".");
       }
       
+
+
       if (WiFi.status() == WL_CONNECTED) {
         connected = true;
         Serial.println("\n✓ WiFi connected!");
+        
+        // ===== FIX: WiFi power save UIT (ESP32-C6 low-level API) =====
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        Serial.println("WiFi power save: DISABLED (ESP32-C6)");
+        
       } else {
         retry_count++;
+
+
+
         Serial.printf("\n✗ Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
         
         if (retry_count < MAX_RETRIES) {
