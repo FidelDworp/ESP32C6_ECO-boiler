@@ -1,10 +1,42 @@
-# ESP32 ECO Controller - v1.6 CHANGELOG
+# ESP32 ECO Controller - CHANGELOG
 
 **Release Date:** 2026-01-15  
 **Author:** Fidel Dworp (with Claude Sonnet)  
 **Focus:** 🚀 WiFi Connectivity Optimalisatie
 
 ---
+
+ * v1.6.1 (2026-01-15) - Compatibility Fix 🔧
+ *   - Fixed: MDNS.announce() niet beschikbaar in ESP32 core 3.3.5
+ *   - Vervangen door MDNS.queryService() workaround (backwards compatible)
+ *   - Alle andere v1.6 fixes blijven actief
+ * 
+ * v1.6 (2026-01-15) - WiFi Connectivity Fix ⚡
+ *   - ESP32-C6 power management optimalisatie (esp_pm_configure)
+ *   - CPU light sleep DISABLED (blijft altijd actief)
+ *   - Beacon listen interval = 1 (luistert naar ELKE router beacon)
+ *   - Loop delay(100) vervangen door yield() (non-blocking)
+ *   - WiFi keepalive mechanisme toegevoegd (5s RSSI ping)
+ *   - mDNS enhanced service registration (ESP32 3.3.5+ compatible)
+ *   - Result: Ping < 10ms constant, ALTIJD bereikbaar! 🎯
+ * 
+ * v1.5 (2026-01-14) - Sleep Mode Fix
+ *   - esp_wifi_set_ps(WIFI_PS_NONE)
+ *   - Ping improved: 300ms → 25ms
+ * 
+ * v1.4 (2026-01-13) - MAC Address Display
+ *   - MAC address visible in settings
+ *   - Voor DHCP reservering in router
+ * 
+ * v1.3 (2026-01-12) - UI Enhancements
+ *   - Temperature scale gauge (-10°C → 120°C)
+ *   - Live charts (3× graphs, 60min data)
+ *   - Trend indicators (↑↓→)
+ *   - Smart pump status messages
+ * 
+ * Older versions: See GitHub commits
+ * Repo: github.com/FidelDworp/ESP32C6_ECO-boiler
+
 
 ## 🎯 PROBLEEM (v1.5)
 
