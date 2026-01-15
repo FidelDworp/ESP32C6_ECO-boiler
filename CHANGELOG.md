@@ -5,38 +5,23 @@
 **Focus:** 🚀 WiFi Connectivity Optimalisatie
 
 ---
+ * Older versions: See GitHub commits
+ * Repo: github.com/FidelDworp/ESP32C6_ECO-boiler
 
- * v1.6.1 (2026-01-15) - Compatibility Fix 🔧
- *   - Fixed: MDNS.announce() niet beschikbaar in ESP32 core 3.3.5
- *   - Vervangen door MDNS.queryService() workaround (backwards compatible)
- *   - Alle andere v1.6 fixes blijven actief
- * 
- * v1.6 (2026-01-15) - WiFi Connectivity Fix ⚡
- *   - ESP32-C6 power management optimalisatie (esp_pm_configure)
- *   - CPU light sleep DISABLED (blijft altijd actief)
- *   - Beacon listen interval = 1 (luistert naar ELKE router beacon)
- *   - Loop delay(100) vervangen door yield() (non-blocking)
- *   - WiFi keepalive mechanisme toegevoegd (5s RSSI ping)
- *   - mDNS enhanced service registration (ESP32 3.3.5+ compatible)
- *   - Result: Ping < 10ms constant, ALTIJD bereikbaar! 🎯
- * 
- * v1.5 (2026-01-14) - Sleep Mode Fix
- *   - esp_wifi_set_ps(WIFI_PS_NONE)
- *   - Ping improved: 300ms → 25ms
- * 
- * v1.4 (2026-01-13) - MAC Address Display
- *   - MAC address visible in settings
- *   - Voor DHCP reservering in router
- * 
  * v1.3 (2026-01-12) - UI Enhancements
  *   - Temperature scale gauge (-10°C → 120°C)
  *   - Live charts (3× graphs, 60min data)
  *   - Trend indicators (↑↓→)
  *   - Smart pump status messages
- * 
- * Older versions: See GitHub commits
- * Repo: github.com/FidelDworp/ESP32C6_ECO-boiler
 
+
+ * v1.4 (2026-01-13) - MAC Address Display
+ *   - MAC address visible in settings
+ *   - Voor DHCP reservering in router
+
+ * v1.5 (2026-01-14) - Sleep Mode Fix
+ *   - esp_wifi_set_ps(WIFI_PS_NONE)
+ *   - Ping improved: 300ms → 25ms
 
 ## 🎯 PROBLEEM (v1.5)
 
@@ -48,6 +33,51 @@ Na upgrade naar v1.5 (sleep mode uit):
 **Oorzaak:** ESP32-C6 heeft automatische **CPU light sleep** die zich anders gedraagt dan oudere ESP32's. De `esp_wifi_set_ps(WIFI_PS_NONE)` fix was onvoldoende.
 
 ---
+
+ * v1.6 (2026-01-15) - WiFi Connectivity Fix ⚡
+ *   - ESP32-C6 power management optimalisatie (esp_pm_configure)
+ *   - CPU light sleep DISABLED (blijft altijd actief)
+ *   - Beacon listen interval = 1 (luistert naar ELKE router beacon)
+ *   - Loop delay(100) vervangen door yield() (non-blocking)
+ *   - WiFi keepalive mechanisme toegevoegd (5s RSSI ping)
+ *   - mDNS enhanced service registration (ESP32 3.3.5+ compatible)
+ *   - Result: Ping < 10ms constant, ALTIJD bereikbaar! 🎯
+
+## 📝 CHANGELOG v1.6 → v1.6.1
+### **Gewijzigd:**
+```diff
+- MDNS.announce()                    // v1.6 (werkt niet in 3.3.5)
++ MDNS.queryService("http", "tcp")   // v1.6.1 (werkt overal)
+```
+
+```diff
+- MDNS.enableArduino(80, true);      // v1.6 (mogelijk problematisch)
++ // verwijderd                       // v1.6.1 (cleanup)
+```
+
+### **Toegevoegd:**
+- Commentaar over ESP32 core compatibility
+- Betere error handling voor mDNS
+
+### **Ongewijzigd:**
+- Alle power management fixes
+- Loop optimalisaties
+- WiFi keepalive
+- Alle functionaliteit blijft identiek!
+
+ * v1.6.1 (2026-01-15) - Compatibility Fix 🔧
+ *   - Fixed: MDNS.announce() niet beschikbaar in ESP32 core 3.3.5
+ *   - Vervangen door MDNS.queryService() workaround (backwards compatible)
+ *   - Alle andere v1.6 fixes blijven actief
+
+Version 1.6.2 (15 jan 2026 @ 23:30) WiFi Connectivity Fix
+✅ ESP32-C6 power management: CPU light sleep disabled
+✅ Beacon listen interval = 1 (max alertness)
+✅ Loop: yield() ipv delay(100) (non-blocking)
+✅ WiFi keepalive (5s RSSI ping)
+✅ mDNS keepalive (30s queryService)
+✅ Backwards compatible (ESP32 core 3.0+)
+
 
 ## ✨ OPLOSSING (v1.6)
 
@@ -135,25 +165,3 @@ if (millis() - last_mdns_announce >= 30000) {
 
 ---
 
-## 📝 CHANGELOG v1.6 → v1.6.1
-
-### **Gewijzigd:**
-```diff
-- MDNS.announce()                    // v1.6 (werkt niet in 3.3.5)
-+ MDNS.queryService("http", "tcp")   // v1.6.1 (werkt overal)
-```
-
-```diff
-- MDNS.enableArduino(80, true);      // v1.6 (mogelijk problematisch)
-+ // verwijderd                       // v1.6.1 (cleanup)
-```
-
-### **Toegevoegd:**
-- Commentaar over ESP32 core compatibility
-- Betere error handling voor mDNS
-
-### **Ongewijzigd:**
-- Alle power management fixes
-- Loop optimalisaties
-- WiFi keepalive
-- Alle functionaliteit blijft identiek!
