@@ -1,49 +1,42 @@
-/* 
- * ESP32_ECO Controller - v1.6.1
- * Solar & Fireplace Energy Controller
- * Author: Fidel Dworp
- * Date: 2026-01-15
- * 
- * CHANGELOG (recent):
- *
- * v1.6.1 (2026-01-15) - Compatibility Fix 🔧
- *   - Fixed: MDNS.announce() niet beschikbaar in ESP32 core 3.3.5
- *   - Vervangen door MDNS.queryService() workaround (backwards compatible)
- *   - Alle andere v1.6 fixes blijven actief
- *  NIET ACCEPTABEL: Claude wijzigde vele andere zaken! (vooral op /settings page. Herstart van vorige versie!!!)
- * 
- * v1.6 (2026-01-15) - WiFi Connectivity Fix ⚡
- *   - ESP32-C6 power management optimalisatie (esp_pm_configure)
- *   - CPU light sleep DISABLED (blijft altijd actief)
- *   - Beacon listen interval = 1 (luistert naar ELKE router beacon)
- *   - Loop delay(100) vervangen door yield() (non-blocking)
- *   - WiFi keepalive mechanisme toegevoegd (5s RSSI ping)
- *   - mDNS enhanced service registration (ESP32 3.3.5+ compatible)
- *   - Result: Ping < 10ms constant, ALTIJD bereikbaar! 🎯
- * 
- * v1.5 (2026-01-14) - Sleep Mode Fix
- *   - esp_wifi_set_ps(WIFI_PS_NONE)
- *   - Ping improved: 300ms → 25ms
- * 
- * v1.4 (2026-01-13) - MAC Address Display
- *   - MAC address visible in settings
- *   - Voor DHCP reservering in router
- * 
- * v1.3 (2026-01-12) - UI Enhancements
- *   - Temperature scale gauge (-10°C → 120°C)
- *   - Live charts (3× graphs, 60min data)
- *   - Trend indicators (↑↓→)
- *   - Smart pump status messages
- * 
- * Older versions: See GitHub commits
- * Repo: github.com/FidelDworp/ESP32C6_ECO-boiler
- * 
- * Hardware:
- * - ESP32-C6 DevKit (16MB flash)
- * - MAX31865 PT1000 module (SPI) - Collector temperature
- * - 6× DS18B20 sensors (1-Wire) - Boiler stratification
- * - Relay module (230V pump control)
- * - PWM output (OEG pump speed control)
+/* ESP32_ECO_V1.6.2.ino - Solar & Fireplace Energy Controller
+ Transition from Photon based to ESP32 C6 based Home automation system. Developed together with Claude Sonnet in januari '26.
+ Author: Fidel Dworp
+
+ Hardware:
+ - ESP32-C6 DevKit (16MB flash)
+ - MAX31865 PT1000 module (SPI) - Collector temperature
+ - 6× DS18B20 sensors (1-Wire) - Boiler stratification
+ - Relay module (230V pump control)
+ - PWM output (OEG pump speed control)
+
+Version 1.6.2 (15 jan 2026 @ 23:30) WiFi Connectivity Fix
+✅ ESP32-C6 power management: CPU light sleep disabled
+✅ Beacon listen interval = 1 (max alertness)
+✅ Loop: yield() ipv delay(100) (non-blocking)
+✅ WiFi keepalive (5s RSSI ping)
+✅ mDNS keepalive (30s queryService)
+✅ Backwards compatible (ESP32 core 3.0+)
+
+Version 1.5 (14 jan 2026 @ 23:09) Sleep mode voor ESP32 C6 uitgeschakeld: Betere bereikbaarheid (ping < 10ms)
+Version 1.4 (13 jan 2026 @ 21:58) Mac address toevoegen in UI: Om static IP te kunnen registreren in router
+Version 1.3 (12 jan 2026 @ 11:0) Features Summary:
+✅ Temperature scale gauge (-10°C → 120°C met kleuren)
+✅ Live charts (3× grafieken, 60 min data)
+✅ Trend indicators (↑↓→) overal
+✅ Smart pump status (20+ berichten)
+✅ Yield today counter (FIXED!)
+✅ Uptime uren + minuten (FIXED!)
+✅ Simulation mode in settings (FIXED!)
+✅ Pump status in JSON (NIEUW!)
+✅ Rode waarschuwingen bij simulation mode
+
+Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
+Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
+- Generates fake realistic data
+- Sun cycle simulation (25-65°C daytime)
+- Stratified boiler temps
+- Working pump logic
+- Perfect for UI testing!
  */
 
 
@@ -541,37 +534,27 @@ void setupWiFi() {
         connected = true;
         Serial.println("\n✓ WiFi connected!");
         
-        // ===== v1.6 CRITICAL FIXES START =====
-        
-        // 1. WiFi MODEM power save UIT
+        // ===== v1.6.2: WiFi power save UIT (ESP32-C6) =====
         esp_wifi_set_ps(WIFI_PS_NONE);
-        Serial.println("✅ WiFi modem power save: DISABLED");
+        Serial.println("WiFi power save: DISABLED");
         
-        // 2. CPU light sleep UIT (ESP32-C6 specifiek!)
+        // ===== v1.6.2: CPU light sleep UIT =====
         esp_pm_config_t pm_config = {
-          .max_freq_mhz = 160,           // Max CPU freq
-          .min_freq_mhz = 160,           // Min CPU freq (NIET verlagen!)
-          .light_sleep_enable = false    // KRITIEK: Light sleep UIT
+          .max_freq_mhz = 160,
+          .min_freq_mhz = 160,
+          .light_sleep_enable = false
         };
         esp_err_t pm_err = esp_pm_configure(&pm_config);
         if (pm_err == ESP_OK) {
-          Serial.println("✅ CPU light sleep: DISABLED (stays always active)");
-        } else {
-          Serial.printf("⚠️ CPU power config failed: %d\n", pm_err);
+          Serial.println("CPU light sleep: DISABLED");
         }
         
-        // 3. Beacon listen interval = 1 (maximale alertheid!)
+        // ===== v1.6.2: Beacon listen interval = 1 =====
         wifi_config_t wifi_config;
         esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
-        wifi_config.sta.listen_interval = 1;  // Luister naar ELKE beacon (~100ms)
+        wifi_config.sta.listen_interval = 1;
         esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-        Serial.println("✅ Beacon listen interval: 1 (max alertness)");
-        
-        Serial.println("\n🎯 v1.6 CONNECTIVITY OPTIMIZATIONS ACTIVE!");
-        Serial.println("   Expected ping: < 10ms constant");
-        Serial.println("   Power usage: +20-30mA (worth it!)");
-        
-        // ===== v1.6 CRITICAL FIXES END =====
+        Serial.println("Beacon interval: 1 (max alert)");
         
       } else {
         retry_count++;
@@ -589,16 +572,9 @@ void setupWiFi() {
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
       
-      // mDNS with enhanced advertising
+      // mDNS
       if (MDNS.begin(config.room_id)) {
         Serial.printf("mDNS: http://%s.local\n", config.room_id);
-        
-        // ===== v1.6: Enhanced mDNS (ESP32 3.3.5 compatible) =====
-        MDNS.addService("http", "tcp", 80);
-        MDNS.setInstanceName(config.room_id);
-        Serial.println("✅ mDNS: Enhanced service registration");
-        // Note: MDNS.announce() requires ESP32 core 3.4.0+
-        // Using queryService() as keepalive in loop instead
       }
       
       ap_mode = false;
@@ -632,12 +608,11 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n\n=== ESP32 ECO Controller v1.6.1 ===");
-  Serial.println("🎯 WiFi Connectivity Optimized!");
-  Serial.println("⚡ Power management: CPU always active");
-  Serial.println("📡 Beacon listen: EVERY beacon (max alert)");
-  Serial.println("🔄 Loop: Non-blocking yield()");
-  Serial.println("🔧 v1.6.1: ESP32 core 3.3.5 compatible");
+  Serial.println("\n\n=== ESP32 ECO Controller V1.6.2 ===");
+  Serial.println("Pin Layout: RJ45 optimized");
+  Serial.println("UI: HVAC V53.4 style");
+  Serial.println("Features: Pump override, 6 temps, system info");
+  Serial.println("Connectivity: CPU always active, yield() loop");
   
   // Check for factory reset (type 'R' within 3s)
   Serial.println("\nFactory reset? Type 'R' within 3 seconds...");
@@ -1327,7 +1302,6 @@ String getMainPage() {
     .smart-status {background:#e6f0ff;border-left:4px solid #369;padding:10px 15px;margin:10px 0;font-size:14px;font-weight:bold;color:#369;border-radius:4px;}
     .chart-box {background:#fff;padding:10px;border-radius:8px;border:1px solid #ddd;margin:15px 0;}
     canvas {width:100%!important;height:200px!important;}
-    .v16-banner {background:linear-gradient(135deg, #0a0 0%, #069 100%);color:#fff;padding:12px;margin:0 0 15px 0;border-radius:8px;text-align:center;font-weight:bold;font-size:14px;box-shadow:0 2px 5px rgba(0,0,0,0.2);}
     @media (max-width: 600px) {
       .container {flex-direction:column;}
       .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
@@ -1339,7 +1313,7 @@ String getMainPage() {
 </head>
 <body>
   <div class="header">
-    <div class="header-left">ECO boiler v1.6.1</div>
+    <div class="header-left">ECO boiler</div>
     <div class="header-right">)rawliteral" + String(uptime_sec / 3600) + "u " + String((uptime_sec % 3600) / 60) + R"rawliteral(m &nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
   </div>
   <div class="container">
@@ -1361,11 +1335,7 @@ String getMainPage() {
     )rawliteral";
   }
   
-  // v1.6 Banner
   html += R"rawliteral(
-      <div class="v16-banner">
-        🚀 v1.6.1 CONNECTIVITY MODE: Ping < 10ms | CPU Always Active | ESP32 3.3.5+ Compatible
-      </div>
       
       <!-- Collector Temperature with SCALE -->
       <div class="section">
@@ -1550,7 +1520,7 @@ String getSettingsPage() {
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings v1.6.1</title>
+<title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings v1.6.2</title>
 <style>
 body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
 .header{display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
@@ -1564,15 +1534,20 @@ body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
 .main{flex:1;padding:20px;overflow-y:auto;}
 h2{color:#369;border-bottom:2px solid #369;padding-bottom:10px;}
 .warning{background:#ffe6e6;border:2px solid #c00;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#900;}
-.v16-info{background:linear-gradient(135deg, #0a0 0%, #069 100%);color:#fff;padding:15px;margin:20px 0;border-radius:8px;}
 table{width:100%;margin:15px 0;}
 td{padding:10px;}
 input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
 .btn{background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
 .btn:hover{background:#036;}
+@media (max-width: 600px) {
+  .container{flex-direction:column;}
+  .sidebar{width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+  .sidebar a{width:60px;margin:0 3px;}
+  .main{padding:8px;}
+}
 </style></head><body>
 <div class="header">
-  <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral( v1.6.1</div>
+  <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral(</div>
   <div class="header-right">Instellingen</div>
 </div>
 <div class="container">
@@ -1583,27 +1558,29 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
     <a href="/settings" class="active">Settings</a>
   </div>
   <div class="main">
-  
-<div class="v16-info">
-  <h3 style="margin:0 0 10px 0;">🚀 v1.6.1 Connectivity Optimalisaties</h3>
-  <ul style="margin:5px 0;padding-left:20px;">
-    <li>ESP32-C6 power management: CPU altijd actief</li>
-    <li>WiFi modem: Geen power save</li>
-    <li>Beacon listen interval: 1 (max alertheid)</li>
-    <li>Loop: yield() ipv delay() (non-blocking)</li>
-    <li>Keepalive: 5s RSSI ping</li>
-    <li>mDNS: Enhanced (ESP32 3.3.5+ compatible)</li>
-  </ul>
-  <p style="margin:10px 0 0 0;"><strong>Result:</strong> Ping < 10ms constant, +20-30mA verbruik</p>
-</div>
+<div class="warning">⚠️ OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
 
-<div class="warning">⚠️ OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!</div>
 
+<!-- MAC ADRES BOX -->
 <div style="background:#e6f0ff;border:3px solid #336699;padding:20px;margin:20px;border-radius:8px;text-align:center;">
   <h3 style="margin:0 0 10px 0;color:#336699;">📡 Controller MAC Adres</h3>
   <div style="font-size:20px;font-weight:bold;color:#003366;font-family:monospace;background:#fff;padding:10px;border-radius:4px;display:inline-block;margin:10px 0;border:2px solid #336699;">)rawliteral" + mac_address + R"rawliteral(</div>
-  <div style="font-size:13px;color:#666;margin-top:10px;">💡 Voor DHCP-reservering in router</div>
+  <div style="font-size:13px;color:#666;margin-top:10px;">💡 Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
 </div>
+
+<!-- AANBEVOLEN CONFIGURATIE -->
+<div style="background:#fffacd;border:2px solid #336699;padding:15px;margin:20px;border-radius:8px;font-size:14px;">
+  <h4 style="margin:0 0 10px 0;color:#336699;">✅ Aanbevolen: DHCP met MAC-reservering</h4>
+  <ol style="margin:10px 0;padding-left:25px;line-height:1.6;">
+    <li>Kopieer het MAC-adres hierboven</li>
+    <li>Log in op je router (meestal 192.168.1.1)</li>
+    <li>Ga naar: LAN → DHCP Server → Manual Assignment</li>
+    <li>Voeg toe: MAC-adres + gewenst IP (bijv. 192.168.1.102)</li>
+    <li>Laat hieronder het "Static IP" veld <strong>LEEG</strong></li>
+    <li>Sla op en reboot deze controller</li>
+  </ol>
+</div>
+
 
 <form action="/save_settings" method="get">
   
@@ -1733,14 +1710,14 @@ void setupWebServer() {
     String html = R"rawliteral(
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OTA Update v1.6.1</title>
+<title>OTA Update</title>
 <style>
 body{font-family:Arial;text-align:center;padding:50px;}
 h1{color:#369;}
 .btn{background:#369;color:#fff;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin:10px;}
 .btn:hover{background:#036;}
 </style></head><body>
-<h1>🚀 OTA Firmware Update v1.6.1</h1>
+<h1>🚀 OTA Firmware Update</h1>
 <form method="POST" action="/update" enctype="multipart/form-data">
   <input type="file" name="update" accept=".bin"><br><br>
   <button class="btn" type="submit">Upload Firmware</button>
@@ -1761,7 +1738,7 @@ h1{color:#369;}
     if (success) { delay(1000); ESP.restart(); }
   }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
     if (!index) {
-      Serial.println("\n=== OTA UPDATE v1.6.1 ===");
+      Serial.println("\n=== OTA UPDATE ===");
       Update.begin(UPDATE_SIZE_UNKNOWN);
     }
     Update.write(data, len);
@@ -1794,6 +1771,6 @@ h1{color:#369;}
   });
   
   server.begin();
-  Serial.println("✅ Web server started (v1.6.1 - ESP32 3.3.5+ compatible)");
+  Serial.println("✅ Web server started");
 }
 
