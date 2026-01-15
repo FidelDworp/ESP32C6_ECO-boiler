@@ -5,11 +5,12 @@
  * Date: 2026-01-15
  * 
  * CHANGELOG (recent):
- * 
+ *
  * v1.6.1 (2026-01-15) - Compatibility Fix 🔧
  *   - Fixed: MDNS.announce() niet beschikbaar in ESP32 core 3.3.5
  *   - Vervangen door MDNS.queryService() workaround (backwards compatible)
  *   - Alle andere v1.6 fixes blijven actief
+ *  NIET ACCEPTABEL: Claude wijzigde vele andere zaken! (vooral op /settings page. Herstart van vorige versie!!!)
  * 
  * v1.6 (2026-01-15) - WiFi Connectivity Fix ⚡
  *   - ESP32-C6 power management optimalisatie (esp_pm_configure)
