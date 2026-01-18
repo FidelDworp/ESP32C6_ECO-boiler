@@ -1,40 +1,19 @@
-/* ESP32_ECO_V1.6.ino - Solar & Fireplace Energy Controller
- Transition from Photon based to ESP32 C6 based Home automation system. Developed together with Claude Sonnet in januari '26.
+/* ESP32_ECO_V1.8.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
+ 
+Version 1.8 (18 jan 2026) DEBUG LOGGING
+✅ LittleFS event logging (800KB, circular buffer)
+✅ Stil tenzij problemen (WIFI_DISC, KA_FAIL, LOOP_SLOW)
+✅ Web endpoints: /log (download), /log/view, /log/clear
+✅ Timestamp correlatie met Mac ping test
 
- Hardware:
- - ESP32-C6 DevKit (16MB flash)
- - MAX31865 PT1000 module (SPI) - Collector temperature
- - 6× DS18B20 sensors (1-Wire) - Boiler stratification
- - Relay module (230V pump control)
- - PWM output (OEG pump speed control)
+Version 1.7 (18 jan 2026) Static IP veld verwijderd uit UI
+Version 1.6 (16 jan 2026) Ping optimalisatie (DHCP only, WiFi sleep UIT, yield loop)
+Version 1.5 (14 jan 2026) Sleep mode UIT
+Version 1.4 (13 jan 2026) MAC adres in UI
+Version 1.3 (12 jan 2026) Grafische UI verbeteringen
 
-Version 1.7 (18 jan 2026) Static IP veld verwijderd uit UI (/settings)
-Version 1.6 (16 jan 2026) PING OPTIMALISATIE - Always-online profiel
-✅ DHCP only (geen WiFi.config static IP)
-✅ WiFi power save UIT + CPU light sleep UIT
-✅ Beacon listen interval = 1 (max alertheid)
-✅ Unicast TCP keepalive naar gateway (30s) - ARP refresh!
-✅ WiFi auto-reconnect
-✅ yield() ipv delay(100) - WiFi stack fully responsive
-→ Result: Ping <10ms constant, ALTIJD bereikbaar!
-
-Version 1.5 (14 jan 2026 @ 23:09) Sleep mode voor ESP32 C6 uitgeschakeld: Betere bereikbaarheid (ping < 10ms)
-Version 1.4 (13 jan 2026 @ 21:58) Mac address toevoegen in UI: Om static IP te kunnen registreren in router
-Version 1.3 (12 jan 2026 @ 11:0) Features Summary:
-✅ Temperature scale gauge (-10°C → 120°C met kleuren)
-✅ Live charts (3× grafieken, 60 min data)
-✅ Trend indicators (↑↓→) overal
-✅ Smart pump status (20+ berichten)
-✅ Yield today counter, Uptime, Simulation mode, Pump status in JSON
-
-Opm: SIMULATION MODE (Voor testen!) => Gebruik "HUGE APP 3Mb" setting!
-Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for real sensors
-- Generates fake realistic data
-- Sun cycle simulation (25-65°C daytime)
-- Stratified boiler temps
-- Working pump logic
-- Perfect for UI testing!
+SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
  */
 
 
@@ -48,8 +27,9 @@ Enable in sketch (regel ~44): #define SIMULATION_MODE true  // Set to false for 
 #include <Update.h>
 #include <time.h>
 #include <esp_wifi.h>
-#include <esp_pm.h>      // v1.6: Power management
-#include <esp_sleep.h>   // v1.6: Sleep wakeup control
+#include <esp_pm.h>
+#include <esp_sleep.h>
+#include <LittleFS.h>    // v1.8: Debug logging
 
 // SPI for MAX31865
 #include <SPI.h>
@@ -235,6 +215,46 @@ struct GraphData {
   int index;  // Current write position (circular buffer)
 } graph_data;
 
+// ============== v1.8: DEBUG LOGGING ==============
+#define LOG_FILE "/debug.log"
+#define MAX_LOG_SIZE 800000  // 800KB
+unsigned long boot_time_ms = 0;
+
+// Event logging function
+void logEvent(const char* event, const char* details = "") {
+  if (!LittleFS.begin()) return;
+  
+  // Check file size, rotate if needed
+  File f = LittleFS.open(LOG_FILE, "r");
+  if (f && f.size() > MAX_LOG_SIZE) {
+    f.close();
+    LittleFS.remove(LOG_FILE);
+  } else if (f) {
+    f.close();
+  }
+  
+  // Open for append
+  f = LittleFS.open(LOG_FILE, "a");
+  if (!f) return;
+  
+  // Format: [uptime] EVENT details
+  unsigned long uptime_sec = (millis() - boot_time_ms) / 1000;
+  unsigned long h = uptime_sec / 3600;
+  unsigned long m = (uptime_sec % 3600) / 60;
+  unsigned long s = uptime_sec % 60;
+  
+  char timestamp[32];
+  snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu]", h, m, s);
+  
+  f.printf("%s %s", timestamp, event);
+  if (strlen(details) > 0) {
+    f.printf(" %s", details);
+  }
+  f.println();
+  
+  f.close();
+}
+
 // ============== NVS KEYS ==============
 #define NVS_NAMESPACE "eco-config"
 // WiFi & System
@@ -307,9 +327,22 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n\n=== ESP32 ECO Controller V1.6 ===");
-  Serial.println("Ping optimalisatie: Always-online profiel actief");
-  Serial.println("Features: DHCP only, WiFi sleep UIT, unicast keepalive, yield() loop");
+  boot_time_ms = millis();  // v1.8: Track boot time
+  
+  // v1.8: Initialize LittleFS for logging
+  if (LittleFS.begin()) {
+    Serial.println("LittleFS mounted OK");
+  } else {
+    Serial.println("⚠ LittleFS mount failed");
+  }
+  
+  Serial.println("\n\n=== ESP32 ECO Controller V1.8 ===");
+  Serial.println("Debug logging: Events naar /debug.log (stil tenzij problemen)");
+  
+  // Log boot event
+  char boot_msg[100];
+  snprintf(boot_msg, sizeof(boot_msg), "heap=%dKB", ESP.getFreeHeap()/1024);
+  logEvent("BOOT", boot_msg);
   
   // Check for factory reset (type 'R' within 3s)
   Serial.println("\nFactory reset? Type 'R' within 3 seconds...");
@@ -457,33 +490,60 @@ void loop() {
     }
   }
   
-  // === v1.6 PING OPTIMALISATIE ===
+  // === v1.8 DEBUG: Loop timing ===
+  static unsigned long loop_start = 0;
+  loop_start = millis();
   
-  // WiFi auto-reconnect (zelfherstellend gedrag)
+  // === v1.6/v1.8 PING OPTIMALISATIE ===
+  
+  // WiFi auto-reconnect + logging
   if (!ap_mode && WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠ WiFi disconnected - attempting reconnect...");
+    logEvent("WIFI_DISC");
     WiFi.reconnect();
   }
   
-  // Unicast TCP keepalive naar gateway (houdt ARP levend!)
-  // Dit is CRUCIAAL voor always-online gedrag op oudere routers
+  // Unicast TCP keepalive naar gateway + timing
   if (!ap_mode && WiFi.status() == WL_CONNECTED && 
       millis() - last_keepalive >= KEEPALIVE_INTERVAL) {
     
     IPAddress gateway = WiFi.gatewayIP();
     if (gateway != IPAddress(0,0,0,0)) {
+      unsigned long ka_start = millis();
       WiFiClient client;
       client.setTimeout(200);
+      
       if (client.connect(gateway, 80)) {
         client.stop();
-        // Stille ARP refresh - geen logging om Serial niet te vervuilen
+        unsigned long ka_time = millis() - ka_start;
+        
+        // Log alleen als keepalive traag is (>200ms)
+        if (ka_time > 200) {
+          char msg[50];
+          snprintf(msg, sizeof(msg), "%lums", ka_time);
+          logEvent("KA_SLOW", msg);
+        }
+      } else {
+        // Keepalive failed!
+        unsigned long ka_time = millis() - ka_start;
+        char msg[50];
+        snprintf(msg, sizeof(msg), "%lums", ka_time);
+        logEvent("KA_FAIL", msg);
+        Serial.println("⚠ Keepalive FAILED");
       }
     }
     last_keepalive = millis();
   }
   
-  // yield() ipv delay(100) - WiFi stack blijft fully responsive!
-  // Dit zorgt voor <10ms ping latency (delay zou 0-100ms vertragen)
+  // Loop timing check
+  unsigned long loop_time = millis() - loop_start;
+  if (loop_time > 100) {
+    char msg[50];
+    snprintf(msg, sizeof(msg), "%lums", loop_time);
+    logEvent("LOOP_SLOW", msg);
+  }
+  
+  // yield() ipv delay(100) - WiFi stack fully responsive
   yield();
 }
 
@@ -751,6 +811,12 @@ void setupWiFi() {
         connected = true;
         Serial.println("\n✓ WiFi connected!");
         Serial.println("✓ Ping optimalisatie actief (always-online profiel)");
+        
+        // v1.8: Log connection
+        char msg[100];
+        snprintf(msg, sizeof(msg), "ip=%s rssi=%d", 
+          WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        logEvent("WIFI_CONN", msg);
         
       } else {
         retry_count++;
@@ -1676,16 +1742,7 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
   <table>
     <tr><td style="width:35%;">WiFi SSID</td><td><input type="text" name="wifi_ssid" value=")rawliteral" + String(config.wifi_ssid) + R"rawliteral("></td></tr>
     <tr><td>WiFi Password</td><td><input type="password" name="wifi_pass" value=")rawliteral" + String(config.wifi_pass) + R"rawliteral("></td></tr>
-    
-    <tr><td colspan="2" style="background:#e8f4f8;border-left:4px solid #0066cc;padding:12px;">
-      <strong style="color:#0066cc;">💡 v1.6: IP-adres vastleggen via DHCP-reservation</strong><br>
-      <span style="font-size:13px;color:#333;">
-        Static IP in de ESP32 is <strong>uitgezet</strong> voor optimale ping performance (&lt;10ms).<br>
-        Voor een vast IP-adres: Reserveer MAC-adres <strong>)rawliteral" + mac_address + R"rawliteral(</strong> in je router.<br>
-        <em>Zie gele instructiebox hierboven voor stap-voor-stap uitleg.</em>
-      </span>
-    </td></tr>
-
+    <tr><td>Static IP</td><td><input type="text" name="static_ip" value=")rawliteral" + String(config.static_ip) + R"rawliteral(" placeholder="leeg = DHCP"></td></tr>
   </table>
 
   <h2>Basis Instellingen</h2>
@@ -2150,6 +2207,87 @@ void setupWebServer() {
     request->send(200, "text/html", "<h2 style='text-align:center;color:#369;'>✅ Opgeslagen! Rebooting in 2 seconds...</h2>");
     delay(2000);
     ESP.restart();
+  });
+  
+  // ============== v1.8: DEBUG LOG ENDPOINTS ==============
+  
+  // Download full log
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (LittleFS.exists(LOG_FILE)) {
+      request->send(LittleFS, LOG_FILE, "text/plain");
+    } else {
+      request->send(200, "text/plain", "Log file not found");
+    }
+  });
+  
+  // View log in browser (last 100 lines)
+  server.on("/log/view", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Debug Log</title>
+<style>
+body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;margin:20px;}
+h1{color:#4ec9b0;}
+pre{background:#252526;padding:15px;border-radius:5px;overflow-x:auto;white-space:pre-wrap;}
+.btn{background:#007acc;color:#fff;padding:10px 20px;text-decoration:none;border-radius:4px;display:inline-block;margin:10px 5px;}
+.btn:hover{background:#005a9e;}
+</style></head><body>
+<h1>🔍 ESP32 ECO Debug Log</h1>
+<a href="/" class="btn">Home</a>
+<a href="/log" class="btn">Download</a>
+<a href="/log/clear" class="btn" onclick="return confirm('Wis log?')">Clear Log</a>
+<pre>)rawliteral";
+
+    File f = LittleFS.open(LOG_FILE, "r");
+    if (f) {
+      // Read last 100 lines (or full file if smaller)
+      String content = f.readString();
+      f.close();
+      
+      // Count lines
+      int lineCount = 0;
+      for (int i = 0; i < content.length(); i++) {
+        if (content[i] == '\n') lineCount++;
+      }
+      
+      // Show last 100 lines
+      if (lineCount > 100) {
+        int skip = lineCount - 100;
+        int skipCount = 0;
+        int startPos = 0;
+        for (int i = 0; i < content.length(); i++) {
+          if (content[i] == '\n') {
+            skipCount++;
+            if (skipCount == skip) {
+              startPos = i + 1;
+              break;
+            }
+          }
+        }
+        html += content.substring(startPos);
+      } else {
+        html += content;
+      }
+    } else {
+      html += "Log file not found\n";
+    }
+    
+    html += R"rawliteral(</pre>
+<p>Legend: BOOT=Boot | WIFI_CONN=Connected | WIFI_DISC=Disconnected | KA_FAIL=Keepalive failed | KA_SLOW=Keepalive slow | LOOP_SLOW=Loop blocked</p>
+</body></html>)rawliteral";
+    
+    request->send(200, "text/html", html);
+  });
+  
+  // Clear log
+  server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (LittleFS.exists(LOG_FILE)) {
+      LittleFS.remove(LOG_FILE);
+    }
+    logEvent("LOG_CLEAR");
+    request->send(200, "text/html", 
+      "<h2 style='text-align:center;color:#369;'>✅ Log gewist! <a href='/log/view'>Terug</a></h2>");
   });
 
 
