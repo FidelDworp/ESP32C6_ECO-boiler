@@ -9,6 +9,7 @@
  - Relay module (230V pump control)
  - PWM output (OEG pump speed control)
 
+Version 1.7 (18 jan 2026) Static IP veld verwijderd uit UI (/settings)
 Version 1.6 (16 jan 2026) PING OPTIMALISATIE - Always-online profiel
 ✅ DHCP only (geen WiFi.config static IP)
 ✅ WiFi power save UIT + CPU light sleep UIT
@@ -1675,7 +1676,16 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
   <table>
     <tr><td style="width:35%;">WiFi SSID</td><td><input type="text" name="wifi_ssid" value=")rawliteral" + String(config.wifi_ssid) + R"rawliteral("></td></tr>
     <tr><td>WiFi Password</td><td><input type="password" name="wifi_pass" value=")rawliteral" + String(config.wifi_pass) + R"rawliteral("></td></tr>
-    <tr><td>Static IP</td><td><input type="text" name="static_ip" value=")rawliteral" + String(config.static_ip) + R"rawliteral(" placeholder="leeg = DHCP"></td></tr>
+    
+    <tr><td colspan="2" style="background:#e8f4f8;border-left:4px solid #0066cc;padding:12px;">
+      <strong style="color:#0066cc;">💡 v1.6: IP-adres vastleggen via DHCP-reservation</strong><br>
+      <span style="font-size:13px;color:#333;">
+        Static IP in de ESP32 is <strong>uitgezet</strong> voor optimale ping performance (&lt;10ms).<br>
+        Voor een vast IP-adres: Reserveer MAC-adres <strong>)rawliteral" + mac_address + R"rawliteral(</strong> in je router.<br>
+        <em>Zie gele instructiebox hierboven voor stap-voor-stap uitleg.</em>
+      </span>
+    </td></tr>
+
   </table>
 
   <h2>Basis Instellingen</h2>
