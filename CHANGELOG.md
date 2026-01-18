@@ -23,6 +23,18 @@
  *   - esp_wifi_set_ps(WIFI_PS_NONE)
  *   - Ping improved: 300ms → 25ms
 
+ * v1.6 (16 jan 2026) PING OPTIMALISATIE - Always-online profiel
+✅ DHCP only (geen WiFi.config static IP)
+✅ WiFi power save UIT + CPU light sleep UIT
+✅ Beacon listen interval = 1 (max alertheid)
+✅ Unicast TCP keepalive naar gateway (30s) - ARP refresh!
+✅ WiFi auto-reconnect
+✅ yield() ipv delay(100) - WiFi stack fully responsive
+→ Result: Ping <10ms constant, ALTIJD bereikbaar!
+
+ * v1.7 (18 jan 2026) Static IP veld verwijderd uit UI (/settings)
+
+
 ## 🎯 PROBLEEM (v1.5)
 
 Na upgrade naar v1.5 (sleep mode uit):
