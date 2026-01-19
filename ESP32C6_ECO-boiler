@@ -1,17 +1,15 @@
-/* ESP32_ECO_V1.8.ino - Solar & Fireplace Energy Controller
+/* ESP32_ECO_V1.9.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
  
-Version 1.8 (18 jan 2026) DEBUG LOGGING
-✅ LittleFS event logging (800KB, circular buffer)
-✅ Stil tenzij problemen (WIFI_DISC, KA_FAIL, LOOP_SLOW)
-✅ Web endpoints: /log (download), /log/view, /log/clear
-✅ Timestamp correlatie met Mac ping test
+Version 1.9 (19 jan 2026) KEEPALIVE VERWIJDERD - TEST
+✅ Unicast TCP keepalive UITGESCHAKELD (blokkeert WiFi stack 200-400ms)
+✅ WiFi event rate limiting (max 1 WIFI_DISC per 10s)
+✅ Test: ping performance zonder keepalive blocking
 
-Version 1.7 (18 jan 2026) Static IP veld verwijderd uit UI
-Version 1.6 (16 jan 2026) Ping optimalisatie (DHCP only, WiFi sleep UIT, yield loop)
-Version 1.5 (14 jan 2026) Sleep mode UIT
-Version 1.4 (13 jan 2026) MAC adres in UI
-Version 1.3 (12 jan 2026) Grafische UI verbeteringen
+Version 1.8.3 (19 jan 2026) NTP check + fallback
+Version 1.8.2 (18 jan 2026) Absolute tijd
+Version 1.8.1 (18 jan 2026) SPIFFS fix
+Version 1.8 (18 jan 2026) Debug logging
 
 SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
  */
@@ -29,7 +27,7 @@ SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
 #include <esp_wifi.h>
 #include <esp_pm.h>
 #include <esp_sleep.h>
-#include <LittleFS.h>    // v1.8: Debug logging
+#include <SPIFFS.h>      // v1.8: Debug logging
 
 // SPI for MAX31865
 #include <SPI.h>
@@ -222,29 +220,49 @@ unsigned long boot_time_ms = 0;
 
 // Event logging function
 void logEvent(const char* event, const char* details = "") {
-  if (!LittleFS.begin()) return;
+  // v1.9: Rate limit WIFI_DISC to prevent event storms (max 1× per 10s)
+  static unsigned long last_wifi_disc = 0;
+  if (strcmp(event, "WIFI_DISC") == 0) {
+    if (millis() - last_wifi_disc < 10000) {
+      return;  // Skip this event - too soon after last one
+    }
+    last_wifi_disc = millis();
+  }
+  
+  if (!SPIFFS.begin(true)) return;  // true = format if mount fails
   
   // Check file size, rotate if needed
-  File f = LittleFS.open(LOG_FILE, "r");
+  File f = SPIFFS.open(LOG_FILE, "r");
   if (f && f.size() > MAX_LOG_SIZE) {
     f.close();
-    LittleFS.remove(LOG_FILE);
+    SPIFFS.remove(LOG_FILE);
   } else if (f) {
     f.close();
   }
   
   // Open for append
-  f = LittleFS.open(LOG_FILE, "a");
+  f = SPIFFS.open(LOG_FILE, "a");
   if (!f) return;
   
-  // Format: [uptime] EVENT details
-  unsigned long uptime_sec = (millis() - boot_time_ms) / 1000;
-  unsigned long h = uptime_sec / 3600;
-  unsigned long m = (uptime_sec % 3600) / 60;
-  unsigned long s = uptime_sec % 60;
+  // v1.8.3: Check if NTP synced (year > 2020), else fallback to uptime
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
   
   char timestamp[32];
-  snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu]", h, m, s);
+  if (timeinfo.tm_year + 1900 > 2020) {
+    // NTP synced - use Brussels absolute time
+    snprintf(timestamp, sizeof(timestamp), "[%04d-%02d-%02d %02d:%02d:%02d]",
+      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    // NTP not synced - fallback to uptime
+    unsigned long uptime_sec = (millis() - boot_time_ms) / 1000;
+    unsigned long h = uptime_sec / 3600;
+    unsigned long m = (uptime_sec % 3600) / 60;
+    unsigned long s = uptime_sec % 60;
+    snprintf(timestamp, sizeof(timestamp), "[UPTIME %02lu:%02lu:%02lu]", h, m, s);
+  }
   
   f.printf("%s %s", timestamp, event);
   if (strlen(details) > 0) {
@@ -329,15 +347,15 @@ void setup() {
   
   boot_time_ms = millis();  // v1.8: Track boot time
   
-  // v1.8: Initialize LittleFS for logging
-  if (LittleFS.begin()) {
-    Serial.println("LittleFS mounted OK");
+  // v1.8: Initialize SPIFFS for logging
+  if (SPIFFS.begin(true)) {  // true = format if needed
+    Serial.println("SPIFFS mounted OK");
   } else {
-    Serial.println("⚠ LittleFS mount failed");
+    Serial.println("⚠ SPIFFS mount failed");
   }
   
-  Serial.println("\n\n=== ESP32 ECO Controller V1.8 ===");
-  Serial.println("Debug logging: Events naar /debug.log (stil tenzij problemen)");
+  Serial.println("\n\n=== ESP32 ECO Controller V1.9 ===");
+  Serial.println("TEST: Keepalive DISABLED - ping performance validation");
   
   // Log boot event
   char boot_msg[100];
@@ -503,6 +521,16 @@ void loop() {
     WiFi.reconnect();
   }
   
+  /* v1.9: Keepalive UITGESCHAKELD - blokkeert WiFi stack!
+   * 
+   * Analyse toonde:
+   * - client.connect(gateway, 80) blokkeert 200-400ms
+   * - Tijdens blocking: WiFi RX thread kan geen packets verwerken
+   * - Resultaat: ping timeouts, trage responses
+   * - LOOP_SLOW events elke 30s = exact keepalive interval
+   * 
+   * Test v1.9: ping performance ZONDER keepalive blocking
+   * 
   // Unicast TCP keepalive naar gateway + timing
   if (!ap_mode && WiFi.status() == WL_CONNECTED && 
       millis() - last_keepalive >= KEEPALIVE_INTERVAL) {
@@ -534,6 +562,7 @@ void loop() {
     }
     last_keepalive = millis();
   }
+  */
   
   // Loop timing check
   unsigned long loop_time = millis() - loop_start;
@@ -2213,8 +2242,8 @@ void setupWebServer() {
   
   // Download full log
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (LittleFS.exists(LOG_FILE)) {
-      request->send(LittleFS, LOG_FILE, "text/plain");
+    if (SPIFFS.exists(LOG_FILE)) {
+      request->send(SPIFFS, LOG_FILE, "text/plain");
     } else {
       request->send(200, "text/plain", "Log file not found");
     }
@@ -2239,7 +2268,7 @@ pre{background:#252526;padding:15px;border-radius:5px;overflow-x:auto;white-spac
 <a href="/log/clear" class="btn" onclick="return confirm('Wis log?')">Clear Log</a>
 <pre>)rawliteral";
 
-    File f = LittleFS.open(LOG_FILE, "r");
+    File f = SPIFFS.open(LOG_FILE, "r");
     if (f) {
       // Read last 100 lines (or full file if smaller)
       String content = f.readString();
@@ -2282,8 +2311,8 @@ pre{background:#252526;padding:15px;border-radius:5px;overflow-x:auto;white-spac
   
   // Clear log
   server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (LittleFS.exists(LOG_FILE)) {
-      LittleFS.remove(LOG_FILE);
+    if (SPIFFS.exists(LOG_FILE)) {
+      SPIFFS.remove(LOG_FILE);
     }
     logEvent("LOG_CLEAR");
     request->send(200, "text/html", 
