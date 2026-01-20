@@ -1,11 +1,10 @@
 /* ESP32_ECO_V1.9.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
  
+Version 1.10 (20 jan 2026) WIFI KEEPALIVE NON-BLOCKING FIX
+✅ WiFi.RSSI() check elke 30s houdt stack wakker (0ms blocking)
+✅ Voorkomt zombie mode zonder TCP connect overhead
 Version 1.9 (19 jan 2026) KEEPALIVE VERWIJDERD - TEST
-✅ Unicast TCP keepalive UITGESCHAKELD (blokkeert WiFi stack 200-400ms)
-✅ WiFi event rate limiting (max 1 WIFI_DISC per 10s)
-✅ Test: ping performance zonder keepalive blocking
-
 Version 1.8.3 (19 jan 2026) NTP check + fallback
 Version 1.8.2 (18 jan 2026) Absolute tijd
 Version 1.8.1 (18 jan 2026) SPIFFS fix
@@ -508,73 +507,55 @@ void loop() {
     }
   }
   
-  // === v1.8 DEBUG: Loop timing ===
-  static unsigned long loop_start = 0;
-  loop_start = millis();
-  
-  // === v1.6/v1.8 PING OPTIMALISATIE ===
-  
-  // WiFi auto-reconnect + logging
-  if (!ap_mode && WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠ WiFi disconnected - attempting reconnect...");
-    logEvent("WIFI_DISC");
-    WiFi.reconnect();
-  }
-  
-  /* v1.9: Keepalive UITGESCHAKELD - blokkeert WiFi stack!
-   * 
-   * Analyse toonde:
-   * - client.connect(gateway, 80) blokkeert 200-400ms
-   * - Tijdens blocking: WiFi RX thread kan geen packets verwerken
-   * - Resultaat: ping timeouts, trage responses
-   * - LOOP_SLOW events elke 30s = exact keepalive interval
-   * 
-   * Test v1.9: ping performance ZONDER keepalive blocking
-   * 
-  // Unicast TCP keepalive naar gateway + timing
-  if (!ap_mode && WiFi.status() == WL_CONNECTED && 
-      millis() - last_keepalive >= KEEPALIVE_INTERVAL) {
+
+
+
+
+
+    // === v1.8 DEBUG: Loop timing ===
+    static unsigned long loop_start = 0;
+    loop_start = millis();
     
-    IPAddress gateway = WiFi.gatewayIP();
-    if (gateway != IPAddress(0,0,0,0)) {
-      unsigned long ka_start = millis();
-      WiFiClient client;
-      client.setTimeout(200);
+    // === v1.10 WIFI KEEPALIVE - NON-BLOCKING ===
+    
+    // WiFi auto-reconnect + logging
+    if (!ap_mode && WiFi.status() != WL_CONNECTED) {
+      Serial.println("⚠ WiFi disconnected - attempting reconnect...");
+      logEvent("WIFI_DISC");
+      WiFi.reconnect();
+    }
+    
+    // v1.10: WiFi keepalive - RSSI check elke 30s houdt stack wakker
+    if (!ap_mode && WiFi.status() == WL_CONNECTED && 
+        millis() - last_keepalive >= KEEPALIVE_INTERVAL) {
       
-      if (client.connect(gateway, 80)) {
-        client.stop();
-        unsigned long ka_time = millis() - ka_start;
-        
-        // Log alleen als keepalive traag is (>200ms)
-        if (ka_time > 200) {
-          char msg[50];
-          snprintf(msg, sizeof(msg), "%lums", ka_time);
-          logEvent("KA_SLOW", msg);
-        }
-      } else {
-        // Keepalive failed!
-        unsigned long ka_time = millis() - ka_start;
+      // Status check + RSSI update = WiFi stack activity (0ms blocking!)
+      wifi_rssi = WiFi.RSSI();
+      last_keepalive = millis();
+      
+      // Debug log elke 10 min om zombie mode te detecteren
+      if (uptime_sec % 600 == 0) {
         char msg[50];
-        snprintf(msg, sizeof(msg), "%lums", ka_time);
-        logEvent("KA_FAIL", msg);
-        Serial.println("⚠ Keepalive FAILED");
+        snprintf(msg, sizeof(msg), "rssi=%d heap=%dKB", wifi_rssi, ESP.getFreeHeap()/1024);
+        logEvent("KEEPALIVE", msg);
       }
     }
-    last_keepalive = millis();
+      
+    // Loop timing check
+    unsigned long loop_time = millis() - loop_start;
+    if (loop_time > 100) {
+      char msg[50];
+      snprintf(msg, sizeof(msg), "%lums", loop_time);
+      logEvent("LOOP_SLOW", msg);
+    }
+    
+    // yield() ipv delay(100) - WiFi stack fully responsive
+    yield();
   }
-  */
-  
-  // Loop timing check
-  unsigned long loop_time = millis() - loop_start;
-  if (loop_time > 100) {
-    char msg[50];
-    snprintf(msg, sizeof(msg), "%lums", loop_time);
-    logEvent("LOOP_SLOW", msg);
-  }
-  
-  // yield() ipv delay(100) - WiFi stack fully responsive
-  yield();
-}
+
+
+
+
 
 // ============================================================================
 // CONFIGURATION
