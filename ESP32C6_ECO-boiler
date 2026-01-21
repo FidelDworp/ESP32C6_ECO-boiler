@@ -278,65 +278,10 @@ struct GraphData {
   int index;  // Current write position (circular buffer)
 } graph_data;
 
-// ============== v1.8: DEBUG LOGGING ==============
-#define LOG_FILE "/debug.log"
-#define MAX_LOG_SIZE 800000  // 800KB
-unsigned long boot_time_ms = 0;
 
-// Event logging function
-void logEvent(const char* event, const char* details = "") {
-  // v1.9: Rate limit WIFI_DISC to prevent event storms (max 1× per 10s)
-  static unsigned long last_wifi_disc = 0;
-  if (strcmp(event, "WIFI_DISC") == 0) {
-    if (millis() - last_wifi_disc < 10000) {
-      return;  // Skip this event - too soon after last one
-    }
-    last_wifi_disc = millis();
-  }
-  
-  if (!SPIFFS.begin(true)) return;  // true = format if mount fails
-  
-  // Check file size, rotate if needed
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (f && f.size() > MAX_LOG_SIZE) {
-    f.close();
-    SPIFFS.remove(LOG_FILE);
-  } else if (f) {
-    f.close();
-  }
-  
-  // Open for append
-  f = SPIFFS.open(LOG_FILE, "a");
-  if (!f) return;
-  
-  // v1.8.3: Check if NTP synced (year > 2020), else fallback to uptime
-  time_t now = time(nullptr);
-  struct tm timeinfo;
-  localtime_r(&now, &timeinfo);
-  
-  char timestamp[32];
-  if (timeinfo.tm_year + 1900 > 2020) {
-    // NTP synced - use Brussels absolute time
-    snprintf(timestamp, sizeof(timestamp), "[%04d-%02d-%02d %02d:%02d:%02d]",
-      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-  } else {
-    // NTP not synced - fallback to uptime
-    unsigned long uptime_sec = (millis() - boot_time_ms) / 1000;
-    unsigned long h = uptime_sec / 3600;
-    unsigned long m = (uptime_sec % 3600) / 60;
-    unsigned long s = uptime_sec % 60;
-    snprintf(timestamp, sizeof(timestamp), "[UPTIME %02lu:%02lu:%02lu]", h, m, s);
-  }
-  
-  f.printf("%s %s", timestamp, event);
-  if (strlen(details) > 0) {
-    f.printf(" %s", details);
-  }
-  f.println();
-  
-  f.close();
-}
+// ============== v1.8: DEBUG LOGGING ==============
+unsigned long boot_time_ms = 0;  // Alleen deze regel houden!
+
 
 // ============== NVS KEYS ==============
 #define NVS_NAMESPACE "eco-config"
@@ -640,16 +585,6 @@ void loop() {
     }
     last_mem_check = millis();
   }
-
-
-
-    // Loop timing check
-    unsigned long loop_time = millis() - loop_start;
-    if (loop_time > 100) {
-      char msg[50];
-      snprintf(msg, sizeof(msg), "%lums", loop_time);
-      logEvent("LOOP_SLOW", msg);
-    }
     
     // yield() ipv delay(100) - WiFi stack fully responsive
     yield();
@@ -2059,8 +1994,89 @@ void setupWebServer() {
       return;
     }
     request->send(200, "text/html", getSettingsPage());
+
+
+});
+  
+  // === v1.13 LOGGING ENDPOINTS ===
+  
+  // View log (HTML)
+  server.on("/log/view", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SPIFFS.begin()) {
+      request->send(500, "text/html", "<h1>SPIFFS Error</h1>");
+      return;
+    }
+    
+    File f = SPIFFS.open("/debug.log", "r");
+    String content = "<html><head><meta charset='utf-8'><title>ECO Log</title>"
+      "<style>body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:20px;}"
+      ".success{background:#1e3a1e;border:2px solid #4caf50;padding:20px;border-radius:8px;text-align:center;color:#4caf50;margin:20px 0;}"
+      "pre{background:#2d2d2d;padding:15px;border-radius:6px;font-size:12px;overflow-x:auto;white-space:pre-wrap;}"
+      ".legend{background:#2d2d2d;padding:10px;border-radius:6px;margin:10px 0;font-size:11px;}"
+      ".legend span{display:inline-block;margin-right:15px;}"
+      "a{color:#4fc3f7;text-decoration:none;}a:hover{text-decoration:underline;}</style></head><body>";
+    
+    content += "<h1>📋 ECO Boiler Log</h1>";
+    content += "<p><a href='/settings'>← Terug naar Settings</a> | <a href='/log'>💾 Download</a> | <a href='/log/clear'>🗑️ Clear</a></p>";
+    
+    if (!f || f.size() == 0) {
+      content += "<div class='success'><h2>✅ LOG IS EMPTY</h2>"
+        "<p>No issues detected since last boot!</p>"
+        "<p style='font-size:14px;margin-top:10px;'>Empty log = healthy system 🎉</p></div>";
+    } else {
+      content += "<div class='legend'><strong>Legend:</strong> "
+        "<span>⚠️ = Warning</span> <span>❌ = Error</span> <span>🔄 = Info</span></div>";
+      content += "<pre>";
+      while (f.available()) {
+        content += (char)f.read();
+      }
+      content += "</pre>";
+    }
+    
+    if (f) f.close();
+    content += "</body></html>";
+    request->send(200, "text/html", content);
   });
   
+  // Download log (raw)
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SPIFFS.begin()) {
+      request->send(500, "text/plain", "SPIFFS Error");
+      return;
+    }
+    File f = SPIFFS.open("/debug.log", "r");
+    if (!f) {
+      request->send(404, "text/plain", "Log file not found");
+      return;
+    }
+    request->send(SPIFFS, "/debug.log", "text/plain");
+    f.close();
+  });
+  
+  // Clear log
+  server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (SPIFFS.begin()) {
+      SPIFFS.remove("/debug.log");
+      SPIFFS.remove("/debug.log.old");
+    }
+    request->redirect("/log/view");
+  });
+  
+  // Restart ESP32
+  server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", "<html><body><h1>Rebooting...</h1><p>Refresh in 10 seconds</p></body></html>");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  // Save settings endpoint (was al daar, behouden!)
+  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+
+
+
+
+
   // Manual control page
   server.on("/manual", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", getManualPage());
