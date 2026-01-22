@@ -2,10 +2,10 @@
  Author: Fidel Dworp
 
 Version 1.13 (21 jan 2026) - PRODUCTION READY
-✅ UDP keepalive (98.5% uptime proven)
-✅ Silent logging (log only problems)
-✅ Universal logging framework
-✅ Settings UI: log view/clear/restart
+ UDP keepalive (98.5% uptime proven)
+ Silent logging (log only problems)
+ Universal logging framework
+ Settings UI: log view/clear/restart
 Version 1.12 (20 jan 2026) AGGRESSIVE DIAGNOSTIC LOGGING
 Version 1.11 (20 jan 2026) UDP KEEPALIVE [76% - BETER maar niet genoeg]
 Version 1.10 (20 jan 2026) WIFI KEEPALIVE NON-BLOCKING FIX [FAILED - 60%]
@@ -45,9 +45,12 @@ SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
 
 // ============== LOGGING SYSTEM (inline - geen apart bestand nodig) ==============
 
-#define LOG_WARN   "⚠️"
-#define LOG_ERROR  "❌"
-#define LOG_INFO   "🔄"
+#define LOG_WARN   "WARN"
+#define LOG_ERROR  "ERR"
+#define LOG_INFO   ""
+
+// Forward declaration
+extern unsigned long uptime_sec;
 
 bool log_initialized = false;
 
@@ -361,7 +364,7 @@ void setup() {
   if (SPIFFS.begin(true)) {  // true = format if needed
     Serial.println("SPIFFS mounted OK");
   } else {
-    Serial.println("⚠ SPIFFS mount failed");
+    Serial.println("WARN SPIFFS mount failed");
   }
   
   Serial.println("\n\n=== ESP32 ECO Controller V1.9 ===");
@@ -686,10 +689,10 @@ void loadConfig() {
   
   // SIMULATION MODE WARNING
   if (SIMULATION_MODE) {
-    Serial.println("\n⚠️⚠️⚠️ WARNING ⚠️⚠️⚠️");
+    Serial.println("\nWARNWARNWARN WARNING WARNWARNWARN");
     Serial.println("SIMULATION MODE ACTIVE!");
     Serial.println("Using FAKE sensor data!");
-    Serial.println("⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️\n");
+    Serial.println("WARNWARNWARNWARNWARNWARNWARNWARNWARNWARNWARNWARN\n");
   }
   
   Serial.printf("Pump thresholds: dT=%.1f/%.1f, Tsun=%.1f-%.1f-%.1f\n", 
@@ -857,8 +860,8 @@ void setupWiFi() {
       
       if (WiFi.status() == WL_CONNECTED) {
         connected = true;
-        Serial.println("\n✓ WiFi connected!");
-        Serial.println("✓ Ping optimalisatie actief (always-online profiel)");
+        Serial.println("\nOK WiFi connected!");
+        Serial.println("OK Ping optimalisatie actief (always-online profiel)");
         
         // v1.8: Log connection
         char msg[100];
@@ -868,7 +871,7 @@ void setupWiFi() {
         
       } else {
         retry_count++;
-        Serial.printf("\n✗ Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
+        Serial.printf("\nX Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
         
         if (retry_count < MAX_RETRIES) {
           Serial.println("Disconnecting and retrying...");
@@ -890,12 +893,12 @@ void setupWiFi() {
       ap_mode = false;
       return;
     } else {
-      Serial.println("\n✗ All WiFi attempts failed -> AP mode");
+      Serial.println("\nX All WiFi attempts failed -> AP mode");
     }
   }
   
   // Fallback to AP mode
-  Serial.println("✗ WiFi connection failed");
+  Serial.println("X WiFi connection failed");
   Serial.println("Starting AP mode...");
   
   WiFi.mode(WIFI_AP);
@@ -904,7 +907,7 @@ void setupWiFi() {
   IPAddress ap_ip = WiFi.softAPIP();
   Serial.printf("AP IP: %s\n", ap_ip.toString().c_str());
   
-  // ✅ CAPTIVE PORTAL DNS (like HVAC!)
+  //  CAPTIVE PORTAL DNS (like HVAC!)
   dnsServer.start(53, "*", ap_ip);
   Serial.println("\n=== CAPTIVE PORTAL ACTIVE ===");
   Serial.println("AP SSID: ECO-Setup");
@@ -943,7 +946,7 @@ void readSensors() {
   
   if (SIMULATION_MODE) {
     // SIMULATION MODE - Generate realistic fake data for testing
-    Serial.println("⚠️ SIMULATION MODE - Using fake data!");
+    Serial.println("WARN SIMULATION MODE - Using fake data!");
     
     // Simulate realistic solar collector behavior
     time_t now;
@@ -1109,7 +1112,7 @@ void checkPumpLogic() {
       // Override still active
       unsigned long remaining = (PUMP_OVERRIDE_DURATION - elapsed) / 1000;
       
-      Serial.printf("⚠️ OVERRIDE %s (%lu seconds remaining)\n", 
+      Serial.printf("WARN OVERRIDE %s (%lu seconds remaining)\n", 
         pump_override_state ? "ON" : "OFF", remaining);
       
       // Apply override state
@@ -1266,7 +1269,7 @@ void publishHVAC() {
   if (httpCode > 0) {
     Serial.printf("HVAC response: %d\n", httpCode);
     if (httpCode == 200) {
-      Serial.println("✓ HVAC received energy data");
+      Serial.println("OK HVAC received energy data");
     }
   } else {
     Serial.printf("HVAC publish failed: %s\n", http.errorToString(httpCode).c_str());
@@ -1385,24 +1388,24 @@ String getTrend(float current, float previous, float threshold = 0.1) {
 String getPumpMessage() {
   time_t now; struct tm tm; time(&now); localtime_r(&now, &tm); int h = tm.tm_hour;
   
-  if (pump_override_active) return pump_override_state ? "🎮 Handmatig: Pomp AAN" : "🎮 Handmatig: Pomp UIT";
-  if (Tsun >= TSUN_OVERHEAT) return "🚨 OVERVERHITTING - Noodkoeling!";
-  if (h < HOUR_START || h >= HOUR_END) return "🌙 Nacht - systeem rust";
+  if (pump_override_active) return pump_override_state ? "[MANUAL] Handmatig: Pomp AAN" : "[MANUAL] Handmatig: Pomp UIT";
+  if (Tsun >= TSUN_OVERHEAT) return " OVERVERHITTING - Noodkoeling!";
+  if (h < HOUR_START || h >= HOUR_END) return "[NIGHT] Nacht - systeem rust";
   
   if (pump_relay) {
-    if (Tsun > TSUN_HIGH && dT > (DT_START_THRESHOLD + 5)) return "☀️ Hoge energie productie! Volle zon!";
-    if (Tsun > (TSUN_OVERHEAT - 5)) return "⚠️ Preventieve koeling - Collector heet!";
-    if (dT > DT_START_THRESHOLD && Tsun > 40) return "✅ Optimaal laden van boiler";
-    if (pwm_value > 150) return "🔄 Energie transport - Hoge snelheid";
-    return "🔄 Energie transport actief";
+    if (Tsun > TSUN_HIGH && dT > (DT_START_THRESHOLD + 5)) return " Hoge energie productie! Volle zon!";
+    if (Tsun > (TSUN_OVERHEAT - 5)) return "WARN Preventieve koeling - Collector heet!";
+    if (dT > DT_START_THRESHOLD && Tsun > 40) return " Optimaal laden van boiler";
+    if (pwm_value > 150) return " Energie transport - Hoge snelheid";
+    return " Energie transport actief";
   } else {
-    if (dEQ < -0.3 && EQtot > 5) return "💧 Warm water verbruik - Er wordt gedoucht!";
+    if (dEQ < -0.3 && EQtot > 5) return "[WATER] Warm water verbruik - Er wordt gedoucht!";
     if (consecutive_reductions >= MAX_LOSS_STREAK) return "⏸️ Verliesstreek - Pomp gestopt";
-    if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) return "🛡️ Thermosiphon preventie actief";
+    if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) return "[PROTECT] Thermosiphon preventie actief";
     if (dT < DT_START_THRESHOLD && Tsun > 30) return "⏳ Te weinig verschil - Wachten op meer dT";
-    if (h >= HOUR_START && h < 10 && Tsun < 30) return "🌅 Collector aan het opwarmen...";
-    if (h >= 18 && h < HOUR_END && Tsun < 40) return "🌇 Zon gaat onder - Productie daalt";
-    if (Tsun < 25) return "☁️ Wachten op zon!";
+    if (h >= HOUR_START && h < 10 && Tsun < 30) return "[SUNRISE] Collector aan het opwarmen...";
+    if (h >= 18 && h < HOUR_END && Tsun < 40) return "[SUNSET] Zon gaat onder - Productie daalt";
+    if (Tsun < 25) return " Wachten op zon!";
     return "⏳ Wachten op betere omstandigheden";
   }
 }
@@ -1503,7 +1506,7 @@ String getMainPage() {
   if (SIMULATION_MODE) {
     html += R"rawliteral(
       <div style="background:#c00;color:#fff;padding:15px;margin:0 0 15px 0;border-radius:8px;text-align:center;font-weight:bold;font-size:18px;">
-        ⚠️⚠️⚠️ SIMULATION MODE ACTIEF - FAKE DATA! ⚠️⚠️⚠️
+        WARNWARNWARN SIMULATION MODE ACTIEF - FAKE DATA! WARNWARNWARN
       </div>
     )rawliteral";
   }
@@ -1512,7 +1515,7 @@ String getMainPage() {
       
       <!-- Collector Temperature with SCALE -->
       <div class="section">
-        <div class="section-title">☀️ COLLECTOR (Dak) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></div>
+        <div class="section-title"> COLLECTOR (Dak) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></div>
         <div class="temp-scale">
           <div class="temp-scale-bar">
             <div class="temp-marker" style="left:)rawliteral" + String(constrain((Tsun + 10) * 100.0 / 130.0, 0, 100)) + R"rawliteral(%;">
@@ -1520,18 +1523,18 @@ String getMainPage() {
             </div>
           </div>
           <div class="temp-scale-labels">
-            <span>-10°C<br>❄️ IJskoud</span>
-            <span>20°C<br>☁️ Koud</span>
-            <span>50°C<br>☀️ Warm</span>
-            <span>80°C<br>🔥 Heet</span>
-            <span>120°C<br>🚨 Gevaar</span>
+            <span>-10°C<br> IJskoud</span>
+            <span>20°C<br> Koud</span>
+            <span>50°C<br> Warm</span>
+            <span>80°C<br> Heet</span>
+            <span>120°C<br> Gevaar</span>
           </div>
         </div>
       </div>
       
       <!-- Temperature Differential -->
       <div class="section">
-        <div class="section-title">🌡️ TEMPERATUURVERSCHIL (dT) <span class="trend">)rawliteral" + tDT + R"rawliteral(</span></div>
+        <div class="section-title"> TEMPERATUURVERSCHIL (dT) <span class="trend">)rawliteral" + tDT + R"rawliteral(</span></div>
         <table>
           <tr><td class="label">Collector (Tsun) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
           <tr><td class="label">Boiler input (Tboil) <span class="trend">)rawliteral" + tTboil + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
@@ -1544,7 +1547,7 @@ String getMainPage() {
       
       <!-- Pump Status with Override Controls -->
       <div class="section">
-        <div class="section-title">💨 POMP STATUS</div>
+        <div class="section-title"> POMP STATUS</div>
         <div class="smart-status">)rawliteral" + msg + R"rawliteral(</div>
         <div style="text-align:center;">
           <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
@@ -1588,7 +1591,7 @@ String getMainPage() {
       
       <!-- Boiler Energy -->
       <div class="section">
-        <div class="section-title">🔋 BOILER ENERGIE <span class="trend">)rawliteral" + tEQ + R"rawliteral(</span></div>
+        <div class="section-title"> BOILER ENERGIE <span class="trend">)rawliteral" + tEQ + R"rawliteral(</span></div>
         <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
           String(EQtot, 2) + R"rawliteral( kWh</div>
         <div class="gauge">
@@ -1604,7 +1607,7 @@ String getMainPage() {
       
       <!-- Boiler Temperatures - ALL 6 -->
       <div class="section">
-        <div class="section-title">🌡️ BOILER TEMPERATUREN</div>
+        <div class="section-title"> BOILER TEMPERATUREN</div>
         <table>
           <tr class="header-row"><td>Zone</td><td>Temperatuur</td></tr>
           <tr><td class="label">)rawliteral" + sensor_nicknames[0] + R"rawliteral(</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td></tr>
@@ -1618,7 +1621,7 @@ String getMainPage() {
       
       <!-- Live Charts -->
       <div class="section">
-        <div class="section-title">📊 LIVE GRAFIEKEN (60 minuten)</div>
+        <div class="section-title"> LIVE GRAFIEKEN (60 minuten)</div>
         <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Temperaturen</h3>
         <div class="chart-box"><canvas id="tempChart"></canvas></div>
         <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Energie</h3>
@@ -1629,7 +1632,7 @@ String getMainPage() {
       
       <!-- System Status -->
       <div class="section">
-        <div class="section-title">⚙️ SYSTEEM</div>
+        <div class="section-title"> SYSTEEM</div>
         <table>
           <tr><td class="label">WiFi IP</td><td class="value">)rawliteral" + (ap_mode ? "AP: " + WiFi.softAPIP().toString() : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
           <tr><td class="label">mDNS naam</td><td class="value">http://)rawliteral" + String(config.room_id) + R"rawliteral(.local</td></tr>
@@ -1641,7 +1644,7 @@ String getMainPage() {
       
       <!-- Refresh Button -->
       <div style="text-align:center;">
-        <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+        <button class="refresh-btn" onclick="location.reload()"> Refresh</button>
       </div>
     </div>
   </div>
@@ -1760,19 +1763,19 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
     <a href="/settings" class="active">Settings</a>
   </div>
   <div class="main">
-<div class="warning">⚠️ OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
+<div class="warning">WARN OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
 
 
 <!-- MAC ADRES BOX -->
 <div style="background:#e6f0ff;border:3px solid #336699;padding:20px;margin:20px;border-radius:8px;text-align:center;">
-  <h3 style="margin:0 0 10px 0;color:#336699;">📡 Controller MAC Adres</h3>
+  <h3 style="margin:0 0 10px 0;color:#336699;"> Controller MAC Adres</h3>
   <div style="font-size:20px;font-weight:bold;color:#003366;font-family:monospace;background:#fff;padding:10px;border-radius:4px;display:inline-block;margin:10px 0;border:2px solid #336699;">)rawliteral" + mac_address + R"rawliteral(</div>
-  <div style="font-size:13px;color:#666;margin-top:10px;">💡 Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
+  <div style="font-size:13px;color:#666;margin-top:10px;">TIP Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
 </div>
 
 <!-- AANBEVOLEN CONFIGURATIE -->
 <div style="background:#fffacd;border:2px solid #336699;padding:15px;margin:20px;border-radius:8px;font-size:14px;">
-  <h4 style="margin:0 0 10px 0;color:#336699;">✅ Aanbevolen: DHCP met MAC-reservering</h4>
+  <h4 style="margin:0 0 10px 0;color:#336699;"> Aanbevolen: DHCP met MAC-reservering</h4>
   <ol style="margin:10px 0;padding-left:25px;line-height:1.6;">
     <li>Kopieer het MAC-adres hierboven</li>
     <li>Log in op je router (meestal 192.168.1.1)</li>
@@ -1833,7 +1836,7 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
 
   <h2>HVAC Integration</h2>
   <table>
-    <tr><td style="width:35%;">HVAC Enabled</td><td><input type="checkbox" name="hvac_enabled" value="1"" + String(config.hvac_enabled ? " checked" : "") + R"rawliteral(></td></tr>
+    <tr><td style="width:35%;">HVAC Enabled</td><td><input type="checkbox" name="hvac_enabled" value="1")rawliteral" + String(config.hvac_enabled ? " checked" : "") + R"rawliteral(></td></tr>
     <tr><td>HVAC IP adres</td><td><input type="text" name="hvac_ip" value=")rawliteral" + String(config.hvac_ip) + R"rawliteral("></td></tr>
     <tr><td>HVAC mDNS naam</td><td><input type="text" name="hvac_mdns" value=")rawliteral" + String(config.hvac_mdns) + R"rawliteral(" placeholder="ZONDER .local"></td></tr>
     <tr><td>Transfer Threshold (kWh)</td><td><input type="number" step="0.1" name="hvac_thresh" value=")rawliteral" + String(HVAC_TRANSFER_THRESHOLD, 1) + R"rawliteral("></td></tr>
@@ -1848,44 +1851,40 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
 
 
 
-    <h2>🔍 Diagnostics & Logging</h2>
+    <h2> Diagnostics & Logging</h2>
     <div style="background:#f5f5f5;padding:15px;margin:10px 0;border-left:4px solid #2196f3;">
       <p><strong>System Logs:</strong></p>
-      <a href="/log/view" class="btn" style="display:inline-block;margin:5px;">📋 View Log</a>
-      <a href="/log" class="btn" style="display:inline-block;margin:5px;">💾 Download</a>
-      <a href="/log/clear" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Clear log?')">🗑️ Clear</a>
-      <a href="/restart" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Restart ESP32?')">🔄 Restart</a>
+      <a href="/log/view" class="btn" style="display:inline-block;margin:5px;"> View Log</a>
+      <a href="/log" class="btn" style="display:inline-block;margin:5px;"> Download</a>
+      <a href="/log/clear" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Clear log?')"> Clear</a>
+      <a href="/restart" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Restart ESP32?')"> Restart</a>
       
       <div style="background:#e8f5e9;padding:10px;margin-top:10px;border-left:4px solid #4caf50;">
-        <strong>✅ Logging Philosophy:</strong>
+        <strong> Logging Philosophy:</strong>
         <ul style="margin:5px 0;padding-left:20px;">
           <li><strong>Empty log = healthy system</strong> (no issues detected)</li>
-          <li>⚠️ Warning = monitor (not critical)</li>
-          <li>❌ Error = needs attention</li>
-          <li>🔄 Info = rare important events</li>
+          <li>WARN Warning = monitor (not critical)</li>
+          <li>ERR Error = needs attention</li>
+          <li> Info = rare important events</li>
         </ul>
       </div>
     </div>
     
-    <h3>📖 Log Event Reference</h3>
+    <h3> Log Event Reference</h3>
     <table style="font-family:monospace;font-size:12px;width:100%;">
-      <tr><td style="width:180px;">❌ WIFI disc</td><td>WiFi disconnected (auto-reconnecting)</td></tr>
-      <tr><td>⚠️ WIFI weak r=X</td><td>Weak signal (RSSI &lt; -75 dBm)</td></tr>
-      <tr><td>❌ KA timeout</td><td>Keepalive failed (network issue)</td></tr>
-      <tr><td>⚠️ KA slow Xms</td><td>Keepalive &gt;50ms (potential issue)</td></tr>
-      <tr><td>⚠️ MEM low XK</td><td>Free heap &lt;100KB (memory low)</td></tr>
+      <tr><td style="width:180px;">ERR WIFI disc</td><td>WiFi disconnected (auto-reconnecting)</td></tr>
+      <tr><td>WARN WIFI weak r=X</td><td>Weak signal (RSSI &lt; -75 dBm)</td></tr>
+      <tr><td>ERR KA timeout</td><td>Keepalive failed (network issue)</td></tr>
+      <tr><td>WARN KA slow Xms</td><td>Keepalive &gt;50ms (potential issue)</td></tr>
+      <tr><td>WARN MEM low XK</td><td>Free heap &lt;100KB (memory low)</td></tr>
     </table>
-)rawliteral";
 
-
-
-
-  <h2 style="color:#c00;">⚠️ SIMULATION MODE (GEVAARLIJK!)</h2>
+  <h2 style="color:#c00;">SIMULATION MODE (GEVAARLIJK!)</h2>
   <div style="background:#ffe6e6;border:3px solid #c00;padding:20px;margin:15px 0;border-radius:8px;">
-    <p style="color:#c00;font-weight:bold;font-size:16px;margin:0 0 10px 0;">⚠️ WAARSCHUWING: ALLEEN VOOR TESTING!</p>
+    <p style="color:#c00;font-weight:bold;font-size:16px;margin:0 0 10px 0;">WAARSCHUWING: ALLEEN VOOR TESTING!</p>
     <p style="margin:0 0 10px 0;">Simulation mode gebruikt NEP sensor data. <strong>NOOIT gebruiken in productie!</strong></p>
     <label style="display:block;margin:10px 0;">
-      <input type="checkbox" name="simulation_mode" value="1"" + String(SIMULATION_MODE ? " checked" : "") + R"rawliteral( style="width:auto;">
+      <input type="checkbox" name="simulation_mode" value="1")rawliteral" + String(SIMULATION_MODE ? " checked" : "") + R"rawliteral( style="width:auto;">
       <strong style="color:#c00;">JA, ik wil simulation mode activeren (FAKE data!)</strong>
     </label>
     <p style="font-size:12px;color:#666;margin:10px 0 0 0;">Als dit aangevinkt is, worden ALLE sensors genegeerd en gebruikt het systeem nep temperaturen!</p>
@@ -1895,8 +1894,8 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
   <div style="padding:10px;">)rawliteral" + sensorNamesHtml + R"rawliteral(</div>
 
   <div style="text-align:center;">
-    <button type="submit" class="btn">💾 Opslaan & Reboot</button>
-    <a href="/" class="btn" style="display:inline-block;text-decoration:none;background:#c00;">❌ Annuleren</a>
+    <button type="submit" class="btn">Opslaan & Reboot</button>
+    <a href="/" class="btn" style="display:inline-block;text-decoration:none;background:#c00;">Annuleren</a>
   </div>
 </form>
 </div></div>
@@ -2016,16 +2015,16 @@ void setupWebServer() {
       ".legend span{display:inline-block;margin-right:15px;}"
       "a{color:#4fc3f7;text-decoration:none;}a:hover{text-decoration:underline;}</style></head><body>";
     
-    content += "<h1>📋 ECO Boiler Log</h1>";
-    content += "<p><a href='/settings'>← Terug naar Settings</a> | <a href='/log'>💾 Download</a> | <a href='/log/clear'>🗑️ Clear</a></p>";
+    content += "<h1> ECO Boiler Log</h1>";
+    content += "<p><a href='/settings'>← Terug naar Settings</a> | <a href='/log'> Download</a> | <a href='/log/clear'> Clear</a></p>";
     
     if (!f || f.size() == 0) {
-      content += "<div class='success'><h2>✅ LOG IS EMPTY</h2>"
+      content += "<div class='success'><h2> LOG IS EMPTY</h2>"
         "<p>No issues detected since last boot!</p>"
-        "<p style='font-size:14px;margin-top:10px;'>Empty log = healthy system 🎉</p></div>";
+        "<p style='font-size:14px;margin-top:10px;'>Empty log = healthy system !</p></div>";
     } else {
       content += "<div class='legend'><strong>Legend:</strong> "
-        "<span>⚠️ = Warning</span> <span>❌ = Error</span> <span>🔄 = Info</span></div>";
+        "<span>WARN = Warning</span> <span>ERR = Error</span> <span> = Info</span></div>";
       content += "<pre>";
       while (f.available()) {
         content += (char)f.read();
@@ -2069,15 +2068,6 @@ void setupWebServer() {
     ESP.restart();
   });
   
-  // Save settings endpoint (was al daar, behouden!)
-  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request) {
-
-
-
-
-
-
-  // Manual control page
   server.on("/manual", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", getManualPage());
   });
@@ -2359,7 +2349,7 @@ void setupWebServer() {
     // Simulation mode (checkbox)
     SIMULATION_MODE = request->hasArg("simulation_mode");
     if (SIMULATION_MODE) {
-      Serial.println("⚠️ SIMULATION MODE ENABLED!");
+      Serial.println("WARN SIMULATION MODE ENABLED!");
     } else {
       Serial.println("Simulation mode DISABLED");
     }
@@ -2368,158 +2358,11 @@ void setupWebServer() {
     saveConfig();
     
     Serial.println("All settings saved to NVS!");
-    request->send(200, "text/html", "<h2 style='text-align:center;color:#369;'>✅ Opgeslagen! Rebooting in 2 seconds...</h2>");
+    request->send(200, "text/html", "<h2 style='text-align:center;color:#369;'> Opgeslagen! Rebooting in 2 seconds...</h2>");
     delay(2000);
     ESP.restart();
   });
   
-  // ============== v1.8: DEBUG LOG ENDPOINTS ==============
-  
-  // Download full log
-  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (SPIFFS.exists(LOG_FILE)) {
-      request->send(SPIFFS, LOG_FILE, "text/plain");
-    } else {
-      request->send(200, "text/plain", "Log file not found");
-    }
-  });
-  
-  // View log in browser (last 100 lines)
-  server.on("/log/view", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = R"rawliteral(
-<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Debug Log</title>
-<style>
-body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;margin:20px;}
-h1{color:#4ec9b0;}
-pre{background:#252526;padding:15px;border-radius:5px;overflow-x:auto;white-space:pre-wrap;}
-.btn{background:#007acc;color:#fff;padding:10px 20px;text-decoration:none;border-radius:4px;display:inline-block;margin:10px 5px;}
-.btn:hover{background:#005a9e;}
-</style></head><body>
-<h1>🔍 ESP32 ECO Debug Log</h1>
-<a href="/" class="btn">Home</a>
-<a href="/log" class="btn">Download</a>
-<a href="/log/clear" class="btn" onclick="return confirm('Wis log?')">Clear Log</a>
-<pre>)rawliteral";
-
-    File f = SPIFFS.open(LOG_FILE, "r");
-    if (f) {
-      // Read last 100 lines (or full file if smaller)
-      String content = f.readString();
-      f.close();
-      
-      // Count lines
-      int lineCount = 0;
-      for (int i = 0; i < content.length(); i++) {
-        if (content[i] == '\n') lineCount++;
-      }
-      
-      // Show last 100 lines
-      if (lineCount > 100) {
-        int skip = lineCount - 100;
-        int skipCount = 0;
-        int startPos = 0;
-        for (int i = 0; i < content.length(); i++) {
-          if (content[i] == '\n') {
-            skipCount++;
-            if (skipCount == skip) {
-              startPos = i + 1;
-              break;
-            }
-          }
-        }
-        html += content.substring(startPos);
-      } else {
-        html += content;
-      }
-    } else {
-      html += "Log file not found\n";
-    }
-    
-    html += R"rawliteral(</pre>
-<p>Legend: BOOT=Boot | WIFI_CONN=Connected | WIFI_DISC=Disconnected | KA_FAIL=Keepalive failed | KA_SLOW=Keepalive slow | LOOP_SLOW=Loop blocked</p>
-</body></html>)rawliteral";
-    
-    request->send(200, "text/html", html);
-  });
-  
-  // Clear log
-  server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (SPIFFS.exists(LOG_FILE)) {
-      SPIFFS.remove(LOG_FILE);
-    }
-    logEvent("LOG_CLEAR");
-    request->send(200, "text/html", 
-      "<h2 style='text-align:center;color:#369;'>✅ Log gewist! <a href='/log/view'>Terug</a></h2>");
-  });
-
-
-// === Logging endpoints ===
-  
-  // View log
-  server.on("/log/view", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = R"(<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Debug Log</title><style>
-body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:20px;}
-a{color:#4fc3f7;text-decoration:none;}
-.empty{background:#1b5e20;color:#c8e6c9;padding:20px;text-align:center;
-       border-radius:8px;font-size:18px;margin:20px 0;}
-pre{background:#252525;padding:15px;overflow-x:auto;}
-</style></head><body>
-<h2>🔍 Debug Log <a href="/" style="float:right;font-size:14px;">← Home</a></h2>
-<div style="margin-bottom:10px;">
-  <a href="/log">💾 Download</a> | 
-  <a href="/log/clear" onclick="return confirm('Clear log?')">🗑️ Clear</a> | 
-  <a href="/restart" onclick="return confirm('Restart ESP32?')">🔄 Restart</a>
-</div>)";
-    
-    File f = SPIFFS.open("/debug.log", FILE_READ);
-    if (!f || f.size() == 0) {
-      html += R"(<div class="empty">✅ LOG IS EMPTY<br>
-System is healthy - no issues detected!<br>
-<small style="font-size:14px;">This is exactly what you want to see.</small></div>)";
-    } else {
-      html += "<pre>";
-      while (f.available()) {
-        html += f.readStringUntil('\n') + "\n";
-      }
-      html += "</pre>";
-    }
-    if (f) f.close();
-    
-    html += R"(<p style="color:#888;margin-top:20px;">
-<strong>Philosophy:</strong> Empty log = perfect system! Entries = investigate.<br>
-⚠️=Warning (monitor) ❌=Error (fix needed) 🔄=Info (rare events)</p>
-</body></html>)";
-    
-    request->send(200, "text/html; charset=utf-8", html);
-  });
-  
-  // Download log
-  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (SPIFFS.exists("/debug.log")) {
-      request->send(SPIFFS, "/debug.log", "text/plain");
-    } else {
-      request->send(404, "text/plain", "Log not found");
-    }
-  });
-  
-  // Clear log
-  server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request){
-    SPIFFS.remove("/debug.log");
-    SPIFFS.remove("/debug.log.old");
-    File f = SPIFFS.open("/debug.log", FILE_WRITE);
-    if (f) f.close();
-    request->redirect("/log/view");
-  });
-  
-  // Restart ESP32
-  server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "text/plain", "Restarting ESP32...");
-    delay(1000);
-    ESP.restart();
-  });
 
 
   server.begin();
