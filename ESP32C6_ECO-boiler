@@ -1,6 +1,7 @@
 /* ESP32_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
+Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
 Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
 Version 1.14 (22 jan 2026) GOOGLE WEBHOOK: LOGGING ON-LINE: Works!
 Version 1.13 (21 jan 2026) - PRODUCTION READY = < VOLLEDIG WERKEND! >
@@ -423,10 +424,6 @@ void setup() {
   delay(1000);
   
   boot_time_ms = millis();  // v1.8: Track boot time
-
-  // Turn OFF WiFi power save: Improve Browser connection to UI
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  Serial.println("WiFi power save: DISABLED");
   
   // v1.8: Initialize SPIFFS for logging
   if (SPIFFS.begin(true)) {  // true = format if needed
@@ -435,8 +432,8 @@ void setup() {
     Serial.println("WARN SPIFFS mount failed");
   }
   
-  Serial.println("\n\n=== ESP32 ECO Controller V1.9 ===");
-  Serial.println("TEST: Keepalive DISABLED - ping performance validation");
+  Serial.println("\n\n=== ESP32 ECO Controller V1.16 ===");
+  Serial.println("FIX: WiFi power save NA WiFi.begin (timing fix)");
   
   // Log boot event
   char boot_msg[100];
@@ -884,29 +881,6 @@ void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(config.room_id);
   
-  // === PING OPTIMALISATIE: WiFi power & sleep configuratie ===
-  // (Dit moet VOOR WiFi.begin volgens ESP-IDF documentatie)
-  esp_wifi_set_ps(WIFI_PS_NONE);  // WiFi modem altijd actief
-  
-  // CPU light sleep UIT (ESP32-C6 specifiek!)
-  esp_pm_config_t pm_config = {
-    .max_freq_mhz = 160,
-    .min_freq_mhz = 160,
-    .light_sleep_enable = false
-  };
-  esp_pm_configure(&pm_config);
-  
-  // Beacon listen interval = 1 (luister naar ELKE beacon)
-  wifi_config_t wifi_cfg;
-  esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
-  wifi_cfg.sta.listen_interval = 1;
-  esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-  
-  // Alle sleep wakeup sources UIT
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  
-  Serial.println("Ping optimalisatie: WiFi sleep UIT, CPU 160MHz fixed, beacon=1");
-  
   // Try to connect if credentials available
   if (strlen(config.wifi_ssid) > 0) {
     Serial.printf("Connecting to '%s'...\n", config.wifi_ssid);
@@ -939,7 +913,34 @@ void setupWiFi() {
       if (WiFi.status() == WL_CONNECTED) {
         connected = true;
         Serial.println("\nOK WiFi connected!");
-        Serial.println("OK Ping optimalisatie actief (always-online profiel)");
+        
+        // ========== CRITICAL FIX: WiFi power save AFTER connection! ==========
+        // Dit moet NA WiFi.begin() en NA succesvolle verbinding!
+        esp_wifi_set_ps(WIFI_PS_NONE);  // WiFi modem altijd actief
+        Serial.println("✓ WiFi power save: DISABLED (always-online mode)");
+        
+        // CPU light sleep UIT (ESP32-C6 specifiek!)
+        esp_pm_config_t pm_config = {
+          .max_freq_mhz = 160,
+          .min_freq_mhz = 160,
+          .light_sleep_enable = false
+        };
+        esp_pm_configure(&pm_config);
+        Serial.println("✓ CPU frequency locked at 160MHz (no light sleep)");
+        
+        // Beacon listen interval = 1 (luister naar ELKE beacon)
+        wifi_config_t wifi_cfg;
+        esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
+        wifi_cfg.sta.listen_interval = 1;
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+        Serial.println("✓ Beacon listen interval: 1 (every beacon)");
+        
+        // Alle sleep wakeup sources UIT
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+        Serial.println("✓ All sleep wakeup sources disabled");
+        
+        Serial.println("✓✓✓ PING OPTIMIZATION: FULLY ACTIVE ✓✓✓");
+        // =====================================================================
         
         // v1.8: Log connection
         char msg[100];
