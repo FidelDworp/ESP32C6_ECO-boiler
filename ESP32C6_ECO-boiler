@@ -2,21 +2,14 @@
  Author: Fidel Dworp
 
 Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
+=> + Nog wat tekst voor UI aangepast.
 Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
 Version 1.14 (22 jan 2026) GOOGLE WEBHOOK: LOGGING ON-LINE: Works!
-Version 1.13 (21 jan 2026) - PRODUCTION READY = < VOLLEDIG WERKEND! >
+Version 1.13 (21 jan 2026) PRODUCTION READY = < VOLLEDIG WERKEND! >
  UDP keepalive (98.5% uptime proven)
  Silent logging (log only problems)
  Universal logging framework
  Settings UI: log view/clear/restart
-Version 1.12 (20 jan 2026) AGGRESSIVE DIAGNOSTIC LOGGING
-Version 1.11 (20 jan 2026) UDP KEEPALIVE [76% - BETER maar niet genoeg]
-Version 1.10 (20 jan 2026) WIFI KEEPALIVE NON-BLOCKING FIX [FAILED - 60%]
-Version 1.9 (19 jan 2026) KEEPALIVE VERWIJDERD - TEST
-Version 1.8.3 (19 jan 2026) NTP check + fallback
-Version 1.8.2 (18 jan 2026) Absolute tijd
-Version 1.8.1 (18 jan 2026) SPIFFS fix
-Version 1.8 (18 jan 2026) Debug logging
 
 SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
  */
@@ -1842,26 +1835,26 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
     <a href="/settings" class="active">Settings</a>
   </div>
   <div class="main">
-<div class="warning">WARN OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
+<div class="warning">OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
 
 
 <!-- MAC ADRES BOX -->
 <div style="background:#e6f0ff;border:3px solid #336699;padding:20px;margin:20px;border-radius:8px;text-align:center;">
   <h3 style="margin:0 0 10px 0;color:#336699;"> Controller MAC Adres</h3>
   <div style="font-size:20px;font-weight:bold;color:#003366;font-family:monospace;background:#fff;padding:10px;border-radius:4px;display:inline-block;margin:10px 0;border:2px solid #336699;">)rawliteral" + mac_address + R"rawliteral(</div>
-  <div style="font-size:13px;color:#666;margin-top:10px;">TIP Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
+  <div style="font-size:13px;color:#666;margin-top:10px;">Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
 </div>
 
-<!-- AANBEVOLEN CONFIGURATIE -->
+<!-- AANBEVOLEN 'Fixed IP' CONFIGURATIE -->
 <div style="background:#fffacd;border:2px solid #336699;padding:15px;margin:20px;border-radius:8px;font-size:14px;">
   <h4 style="margin:0 0 10px 0;color:#336699;"> Aanbevolen: DHCP met MAC-reservering</h4>
   <ol style="margin:10px 0;padding-left:25px;line-height:1.6;">
-    <li>Kopieer het MAC-adres hierboven</li>
+    <li>Kopieer dit MAC-adres</li>
     <li>Log in op je router (meestal 192.168.1.1)</li>
     <li>Ga naar: LAN → DHCP Server → Manual Assignment</li>
-    <li>Voeg toe: MAC-adres + gewenst IP (bijv. 192.168.1.102)</li>
+    <li>Voeg toe: MAC-adres + gewenst IP (bijv. 192.168.1.99)</li>
     <li>Laat hieronder het "Static IP" veld <strong>LEEG</strong></li>
-    <li>Sla op en reboot deze controller</li>
+    <li>Sla op en reboot de controller</li>
   </ol>
 </div>
 
