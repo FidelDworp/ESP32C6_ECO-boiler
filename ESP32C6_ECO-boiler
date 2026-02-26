@@ -1,8 +1,8 @@
 /* ESP32_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
+Version 1.17 (26 feb 2026) WiFi FIXED IP in telenet router: Config = 192.168.0.71 (Zie tabel)
 Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
-=> + Nog wat tekst voor UI aangepast.
 Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
 Version 1.14 (22 jan 2026) GOOGLE WEBHOOK: LOGGING ON-LINE: Works!
 Version 1.13 (21 jan 2026) PRODUCTION READY = < VOLLEDIG WERKEND! >
@@ -13,7 +13,6 @@ Version 1.13 (21 jan 2026) PRODUCTION READY = < VOLLEDIG WERKEND! >
 
 SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
  */
-
 
 // ============== INCLUDES ==============
 #include <WiFi.h>
@@ -27,20 +26,13 @@ SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
 #include <esp_wifi.h>
 #include <esp_pm.h>
 #include <esp_sleep.h>
-#include <SPIFFS.h>      // v1.8: Debug logging
-
-// SPI for MAX31865
-#include <SPI.h>
+#include <SPIFFS.h> // v1.8: Debug logging
+#include <SPI.h>    // SPI for MAX31865
 #include <Adafruit_MAX31865.h>
-
-// 1-Wire for DS18B20 (ESP32-C6 compatible!)
-#include <OneWireNg_CurrentPlatform.h>
-
+#include <OneWireNg_CurrentPlatform.h> // 1-Wire for DS18B20 (ESP32-C6 compatible!)
 #include <WiFiUdp.h>  // ← NIEUW
 
-
-// ============== LOGGING SYSTEM (inline - geen apart bestand nodig) ==============
-
+// ============== LOGGING SYSTEM ==============
 #define LOG_WARN   "WARN"
 #define LOG_ERROR  "ERR"
 #define LOG_INFO   ""
@@ -98,7 +90,6 @@ void logError(const char* msg) { logEvent(LOG_ERROR, msg); }
 void logInfo(const char* msg)  { logEvent(LOG_INFO, msg); }
 
 // ============== EINDE LOGGING SYSTEM ==============
-
 
 // ============== PIN DEFINITIONS ==============
 // SIMULATION MODE - Set to true for testing without sensors
@@ -347,11 +338,8 @@ float calculatePWM(float dT, float Tsun);
 
 
 
-
-
-
 // ============================================================
-// GOOGLE SHEETS LOGGING - MATCHED TO YOUR /json ENDPOINT
+// GOOGLE SHEETS LOGGING - MATCHED TO /json ENDPOINT
 // ============================================================
 void logToGoogleSheets() {
   // Skip if WiFi not connected
@@ -406,12 +394,9 @@ void logToGoogleSheets() {
 
 
 
-
-
-
-// ============================================================================
+// =========
 // SETUP
-// ============================================================================
+// =========
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -452,7 +437,7 @@ void setup() {
   
   // Initialize graph data
   memset(&graph_data, 0, sizeof(graph_data));
-  
+
   // Setup WiFi & Web Server
   setupWiFi();
   setupWebServer();
@@ -473,12 +458,9 @@ void setup() {
 
 
 
-
-
-
-// ============================================================================
+// ============
 // MAIN LOOP
-// ============================================================================
+// ============
 void loop() {
   // Handle DNS (if in AP mode)
   if (ap_mode) {
@@ -661,14 +643,9 @@ void loop() {
 
 
 
-
-
-
-
-
-// ============================================================================
+// ===============
 // CONFIGURATION
-// ============================================================================
+// ===============
 void loadConfig() {
   preferences.begin(NVS_NAMESPACE, false);
   
@@ -836,9 +813,9 @@ void factoryReset() {
   ESP.restart();
 }
 
-// ============================================================================
+// ===============
 // HARDWARE SETUP
-// ============================================================================
+// ===============
 void setupPump() {
   // Relay
   pinMode(RELAY_PIN, OUTPUT);
@@ -867,30 +844,53 @@ void setupSensors() {
   Serial.println("  Expected: 6 sensors");
 }
 
-// ============================================================================
-// WIFI SETUP - v1.6 PING OPTIMALISATIE
-// ============================================================================
+
+// =====================================
+// WIFI SETUP - v1.6 PING OPTIMALISATIE + STATIC IP ondersteuning (v1.7)
+// =====================================
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(config.room_id);
   
-  // Try to connect if credentials available
   if (strlen(config.wifi_ssid) > 0) {
     Serial.printf("Connecting to '%s'...\n", config.wifi_ssid);
     
-    // === v1.6: GEEN static IP! DHCP only ===
-    // Static IP wordt uitsluitend via router DHCP-reservation ingesteld
-    // (zie settings page voor MAC-adres)
-    
-    // HVAC-style retry logic: 5 attempts @ 20s each
+    // Static IP ondersteuning (optioneel via settings veld)
+    IPAddress local_IP;
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress primaryDNS(8, 8, 8, 8);
+
+    bool useStatic = (strlen(config.static_ip) > 0) && local_IP.fromString(config.static_ip);
+
+    // Leid gateway automatisch af van static IP (vervang laatste octet door 1)
+    // bv. 192.168.1.71 → gateway 192.168.1.1
+    IPAddress gateway(local_IP[0], local_IP[1], local_IP[2], 1);
+
+    if (useStatic) {
+      Serial.printf("Static IP: %s  Gateway (auto): %s\n", config.static_ip, gateway.toString().c_str());
+    } else {
+      Serial.print("Geen static IP → gebruik DHCP ");
+    }
+
+    // Retry logic: 5 attempts @ 20s each
     int retry_count = 0;
     const int MAX_RETRIES = 5;
     bool connected = false;
     
     while (!connected && retry_count < MAX_RETRIES) {
+      
+      if (useStatic) {
+        if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+          Serial.println("WiFi.config() MISLUKT! → fallback naar DHCP");
+          logError("WiFi.config() failed - fallback to DHCP");
+          useStatic = false;
+        } else {
+          Serial.println("OK");
+        }
+      }
+
       WiFi.begin(config.wifi_ssid, config.wifi_pass);
       
-      // Haal MAC op NA eerste WiFi.begin
       if (retry_count == 0) {
         mac_address = WiFi.macAddress();
         Serial.println("MAC adres: " + mac_address);
@@ -907,12 +907,10 @@ void setupWiFi() {
         connected = true;
         Serial.println("\nOK WiFi connected!");
         
-        // ========== CRITICAL FIX: WiFi power save AFTER connection! ==========
-        // Dit moet NA WiFi.begin() en NA succesvolle verbinding!
-        esp_wifi_set_ps(WIFI_PS_NONE);  // WiFi modem altijd actief
+        // CRITICAL: powersave fixes NA connectie
+        esp_wifi_set_ps(WIFI_PS_NONE);
         Serial.println("✓ WiFi power save: DISABLED (always-online mode)");
         
-        // CPU light sleep UIT (ESP32-C6 specifiek!)
         esp_pm_config_t pm_config = {
           .max_freq_mhz = 160,
           .min_freq_mhz = 160,
@@ -921,21 +919,17 @@ void setupWiFi() {
         esp_pm_configure(&pm_config);
         Serial.println("✓ CPU frequency locked at 160MHz (no light sleep)");
         
-        // Beacon listen interval = 1 (luister naar ELKE beacon)
         wifi_config_t wifi_cfg;
         esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
         wifi_cfg.sta.listen_interval = 1;
         esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
         Serial.println("✓ Beacon listen interval: 1 (every beacon)");
         
-        // Alle sleep wakeup sources UIT
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
         Serial.println("✓ All sleep wakeup sources disabled");
         
         Serial.println("✓✓✓ PING OPTIMIZATION: FULLY ACTIVE ✓✓✓");
-        // =====================================================================
         
-        // v1.8: Log connection
         char msg[100];
         snprintf(msg, sizeof(msg), "ip=%s rssi=%d", 
           WiFi.localIP().toString().c_str(), WiFi.RSSI());
@@ -952,12 +946,11 @@ void setupWiFi() {
         }
       }
     }
-    
+
     if (connected) {
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
       
-      // mDNS (convenience only, niet kritisch voor bereikbaarheid)
       if (MDNS.begin(config.room_id)) {
         Serial.printf("mDNS: http://%s.local\n", config.room_id);
       }
@@ -968,6 +961,10 @@ void setupWiFi() {
       Serial.println("\nX All WiFi attempts failed -> AP mode");
     }
   }
+
+
+
+
   
   // Fallback to AP mode
   Serial.println("X WiFi connection failed");
@@ -989,9 +986,9 @@ void setupWiFi() {
   ap_mode = true;
 }
 
-// ============================================================================
+// ===============
 // SENSOR READING
-// ============================================================================
+// ===============
 float readPT1000() {
   // Read PT1000 via MAX31865 (manual calculation to avoid freeze bug)
   uint16_t rtd = pt1000.readRTD();
@@ -1162,17 +1159,14 @@ void calculateEnergy() {
     EQtot, EQ1, EQ2, EQ3, EQ4, EQ5);
 }
 
-// Continue with PART 3 for pump logic and web interface...
 
-// ============== END OF PART 2/3 ==============
-/* ============================================================================
- * ESP32_ECO_V1_1.ino - PART 3A/3
+/* =============================
  * PUMP LOGIC & HELPER FUNCTIONS
- * ============================================================================ */
+ * ============================= */
 
-// ============================================================================
+// =============================
 // PUMP CONTROL LOGIC
-// ============================================================================
+// =============================
 void checkPumpLogic() {
   Serial.println("\n=== Pump Logic Check ===");
   
@@ -1310,9 +1304,9 @@ void controlPump(bool state, int pwm) {
   ledcWrite(PWM_PIN, state ? pwm : 0);
 }
 
-// ============================================================================
+// =================
 // HVAC INTEGRATION
-// ============================================================================
+// =================
 void publishHVAC() {
   if (!config.hvac_enabled) return;
   if (ap_mode) return;  // Can't publish in AP mode
@@ -1350,9 +1344,9 @@ void publishHVAC() {
   http.end();
 }
 
-// ============================================================================
+// =========
 // GRAPHING
-// ============================================================================
+// =========
 void addGraphSample() {
   // Add current values to circular buffer
   graph_data.tsun[graph_data.index] = Tsun;
@@ -1417,9 +1411,9 @@ String getGraphDataJSON() {
   return json;
 }
 
-// ============================================================================
+// =================
 // HELPER FUNCTIONS
-// ============================================================================
+// =================
 String getFormattedDateTime() {
   time_t now;
   struct tm timeinfo;
@@ -1431,24 +1425,10 @@ String getFormattedDateTime() {
   return String(buffer);
 }
 
-// ============== END OF PART 3A/3 ==============
-// Continue with PART 3B for web interface...
-/* ============================================================================
- * ESP32_ECO_V1_1.ino - PART 3B/3 - FINAL
- * WEB INTERFACE & SERVER ENDPOINTS
- * 
- * PLAK ALLE 4 DELEN ACHTER ELKAAR:
- * 1. PART1 (headers, config, globals)
- * 2. PART2 (setup, loop, sensors)
- * 3. PART3A (pump logic, helpers)
- * 4. PART3B (dit bestand - web interface)
- * 
- * Dan heb je de COMPLETE sketch!
- * ============================================================================ */
 
-// ============================================================================
+// ======================
 // UI V3 HELPER FUNCTIONS
-// ============================================================================
+// ======================
 
 // Calculate trend (↑↓→)
 String getTrend(float current, float previous, float threshold = 0.1) {
@@ -1482,9 +1462,9 @@ String getPumpMessage() {
   }
 }
 
-// ============================================================================
+// ============================
 // WEB PAGES - Main Status Page
-// ============================================================================
+// ============================
 String getMainPage() {
   // Calculate trends (vs 5 min ago)
   int prev = (graph_data.index - 5 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
@@ -1780,12 +1760,10 @@ String getMainPage() {
   return html;
 }
 
-// ============================================================================
+// ==========================
 // WEB PAGES - Settings Page
-// ============================================================================
-// ============================================================================
-// SETTINGS PAGE - Complete like HVAC V53.4!
-// ============================================================================
+// ==========================
+
 String getSettingsPage() {
   // Build sensor nicknames HTML
   String sensorNamesHtml = "";
@@ -2035,13 +2013,13 @@ String getManualPage() {
   return html;
 }
 
-// ============================================================================
+// ============================
 // WEB SERVER SETUP & ENDPOINTS
-// ============================================================================
+// ============================
 void setupWebServer() {
-  // ============================================================================
+  // =================================
   // CAPTIVE PORTAL - Like HVAC V53.4!
-  // ============================================================================
+  // =================================
   // Redirect all unknown requests to /settings in AP mode
   server.onNotFound([](AsyncWebServerRequest *request){
     if (ap_mode) {
