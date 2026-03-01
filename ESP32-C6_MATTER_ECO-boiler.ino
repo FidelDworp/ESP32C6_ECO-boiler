@@ -1,0 +1,2643 @@
+/* ESP32-C6_MATTER_ECO-boiler.ino - Solar & Fireplace Energy Controller
+ Author: Fidel Dworp
+
+Version 1.18 (1 mar 2026) MATTER integrated
+Version 1.17 (26 feb 2026) WiFi FIXED IP in telenet router: Config = 192.168.0.71 (Zie tabel)
+Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
+Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
+Version 1.14 (22 jan 2026) GOOGLE WEBHOOK: LOGGING ON-LINE: Works!
+Version 1.13 (21 jan 2026) PRODUCTION READY = < VOLLEDIG WERKEND! >
+ UDP keepalive (98.5% uptime proven)
+ Silent logging (log only problems)
+ Universal logging framework
+ Settings UI: log view/clear/restart
+
+SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
+ */
+
+// ============== INCLUDES ==============
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <time.h>
+#include <esp_wifi.h>
+#include <esp_pm.h>
+#include <esp_sleep.h>
+#include <SPIFFS.h> // v1.8: Debug logging
+#include <SPI.h>    // SPI for MAX31865
+#include <Adafruit_MAX31865.h>
+#include <OneWireNg_CurrentPlatform.h> // 1-Wire for DS18B20 (ESP32-C6 compatible!)
+#include <WiFiUdp.h>  // ← NIEUW
+#include <nvs.h>
+#include <Matter.h>
+#include <MatterEndPoints/MatterTemperatureSensor.h>
+#include <MatterEndPoints/MatterHumiditySensor.h>
+#include <MatterEndPoints/MatterFan.h>
+
+// ============== LOGGING SYSTEM ==============
+#define LOG_WARN   "WARN"
+#define LOG_ERROR  "ERR"
+#define LOG_INFO   ""
+
+// Forward declaration
+extern unsigned long uptime_sec;
+
+bool log_initialized = false;
+
+bool initLogging() {
+  if (!SPIFFS.begin(true)) return false;
+  if (!SPIFFS.exists("/debug.log")) {
+    File f = SPIFFS.open("/debug.log", FILE_WRITE);
+    if (f) f.close();
+  }
+  log_initialized = true;
+  return true;
+}
+
+void logEvent(const char* level, const char* msg) {
+  if (!log_initialized) return;
+  
+  File f = SPIFFS.open("/debug.log", FILE_APPEND);
+  if (!f) return;
+  
+  char ts[16];
+  time_t now;
+  time(&now);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  
+  if (now < 1700000000) {
+    snprintf(ts, 16, "%02d:%02d:%02d", 
+             (int)(uptime_sec/3600), (int)((uptime_sec%3600)/60), (int)(uptime_sec%60));
+  } else {
+    strftime(ts, 16, "%H:%M:%S", &ti);
+  }
+  
+  f.printf("[%s] %s %s\n", ts, level, msg);
+  f.close();
+  
+  // Rotate at 800KB
+  File logFile = SPIFFS.open("/debug.log", FILE_READ);
+  if (logFile.size() > 819200) {
+    logFile.close();
+    SPIFFS.remove("/debug.log.old");
+    SPIFFS.rename("/debug.log", "/debug.log.old");
+  } else {
+    logFile.close();
+  }
+}
+
+void logWarn(const char* msg)  { logEvent(LOG_WARN, msg); }
+void logError(const char* msg) { logEvent(LOG_ERROR, msg); }
+void logInfo(const char* msg)  { logEvent(LOG_INFO, msg); }
+
+// ============== EINDE LOGGING SYSTEM ==============
+
+// ============== PIN DEFINITIONS ==============
+// SIMULATION MODE - Set to true for testing without sensors
+// ============== SIMULATION MODE ==============
+bool SIMULATION_MODE = false;  // Can be changed via settings (DANGEROUS!)
+
+// 1-Wire pin (DS18B20 boiler sensors) - RJ45 Connector 1
+#define ONEWIRE_PIN  3
+
+// Pump control - RJ45 Connector 1 (samen met 1-Wire!)
+#define RELAY_PIN  1   // 230V pump relay (active LOW)
+#define PWM_PIN    5   // OEG pump PWM speed control (0-255)
+
+// SPI pins (MAX31865 PT1000) - Extra vrije pins (groepje bij elkaar!)
+#define SPI_CS    20   // Chip Select
+#define SPI_MOSI  21   // MOSI
+#define SPI_MISO  22   // MISO
+#define SPI_SCK   23   // Clock
+
+// PWM configuration
+#define PWM_FREQ    1000  // 1kHz
+#define PWM_RESOLUTION 8  // 8-bit (0-255)
+
+// ============== CONSTANTS ==============
+// Pump control thresholds (configurable via NVS)
+float DT_START_THRESHOLD = 3.0;      // °C - Start pump
+float DT_STOP_THRESHOLD = 2.0;       // °C - Stop pump (hysteresis)
+float TSUN_MIN_TEMP = 22.0;          // °C - Thermosiphon prevention
+float TSUN_OVERHEAT = 90.0;          // °C - Overheat protection
+float TSUN_HIGH = 75.0;              // °C - High temp threshold
+int MAX_LOSS_STREAK = 3;            // Number of consecutive losses
+int PWM_MIN = 80;                    // Minimum pump speed
+int PWM_MAX = 200;                   // Maximum regular speed
+int PWM_OVERHEAT = 255;              // Overheat speed
+
+// Energy calculation (configurable)
+float ETMIN = 35.0;                  // °C - Minimum temp for Qtot
+float GLYCOL_PERCENT = 0.0;          // % glycol in system (0-50)
+float BOILER_VOLUME_TOTAL = 490.0;   // Liters total
+
+// Volume distribution (5 zones)
+float ZONE_VOLUMES[5] = {110.0, 90.0, 90.0, 90.0, 110.0}; // Liters per zone
+
+// Timing intervals
+const unsigned long SENSOR_INTERVAL = 60000;      // 60s - Read sensors
+const unsigned long PUMP_CHECK_INTERVAL = 60000;  // 60s - Check pump logic
+const unsigned long DEQ_INTERVAL = 600000;        // 10 min - Calculate dEQ
+const unsigned long HVAC_PUBLISH_INTERVAL = 300000; // 5 min - HVAC update
+
+// PT1000 calibration
+const float RREF = 4000.0;    // Reference resistance (Chinese modules)
+const float RNOMINAL = 1000.0; // PT1000 @ 0°C
+
+// Operating hours (mutable - can be changed via settings)
+int HOUR_START = 7;     // Start hour (morning)
+int HOUR_END = 21;      // End hour (evening)
+
+// HVAC integration threshold
+float HVAC_TRANSFER_THRESHOLD = 15.0;  // kWh - Trigger HVAC transfer
+
+// ============== GLOBAL OBJECTS ==============
+Preferences preferences;
+AsyncWebServer server(80);
+DNSServer dnsServer;
+
+// Sensors
+Adafruit_MAX31865 pt1000 = Adafruit_MAX31865(SPI_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
+OneWireNg_CurrentPlatform ow(ONEWIRE_PIN, false);
+
+// ============== CONFIGURATION STRUCTURE ==============
+struct Config {
+  char room_id[32];
+  char wifi_ssid[64];
+  char wifi_pass[64];
+  char static_ip[16];
+  char hvac_ip[16];
+  char hvac_mdns[32];
+  bool hvac_enabled;
+  
+  // Loaded values (from defines above)
+  float dt_start;
+  float dt_stop;
+  float tsun_min;
+  float tsun_overheat;
+  float tsun_high;
+  int max_loss_streak;
+  int pwm_min;
+  int pwm_max;
+  int pwm_overheat;
+  float etmin;
+  float glycol_percent;
+  float boiler_volume;
+  float hvac_threshold;
+} config;
+
+// Global MAC address (voor display in settings)
+String mac_address = "";
+
+// Sensor nicknames (global)
+String sensor_nicknames[6] = {
+  "ETopH (Top High)",
+  "ETopL (Top Low)", 
+  "EMidH (Mid High)",
+  "EMidL (Mid Low)",
+  "EBotH (Bottom High)",
+  "EBotL (Bottom Low)"
+};
+
+// ============== SENSOR DATA ==============
+// DS18B20 addresses (from Photon sketch) - OneWireNg format for ESP32-C6!
+OneWireNg::Id boilerSensors[6] = {
+  {0x28,0xFF,0x0D,0x4C,0x05,0x16,0x03,0xC7}, // ETopH
+  {0x28,0xFF,0x25,0x1A,0x01,0x16,0x04,0xCD}, // ETopL
+  {0x28,0xFF,0x89,0x19,0x01,0x16,0x04,0x57}, // EMidH
+  {0x28,0xFF,0x21,0x9F,0x61,0x15,0x03,0xF9}, // EMidL
+  {0x28,0xFF,0x16,0x6B,0x00,0x16,0x03,0x08}, // EBotH
+  {0x28,0xFF,0x90,0xA2,0x00,0x16,0x04,0x76}  // EBotL
+};
+
+// Temperature storage
+float ETopH = 0, ETopL = 0, EMidH = 0, EMidL = 0, EBotH = 0, EBotL = 0;
+float EAv = 0;      // Average boiler temp
+float Tsun = 0;     // Collector temp (PT1000)
+float Tboil = 0;    // Boiler input temp (EBotH)
+float dT = 0;       // Temperature differential
+
+// Energy
+float EQtot = 0;    // Total available energy (kWh)
+float dEQ = 0;      // Energy change over 10 min (kWh)
+float prev_EQtot = 0;
+
+// Pump state
+bool pump_relay = false;       // Relay state
+int pwm_value = 0;             // PWM value (0-255)
+String pump_status = "IDLE";   // Status message
+int consecutive_reductions = 0; // Loss streak counter
+
+// Pump override control (like HVAC circuit overrides)
+bool pump_override_active = false;
+bool pump_override_state = false;  // true = ON, false = OFF
+unsigned long pump_override_start = 0;
+const unsigned long PUMP_OVERRIDE_DURATION = 60000UL;  // 60 seconds
+
+// Matter: gewenste PWM bij override (analoog aan SIM's pwm_override)
+int pwm_override = 0;
+
+// Matter: EQ_MAX voor boilervolheid % (berekend na loadConfig())
+float EQ_MAX = 0.0f;
+
+// Matter: vlaggen (zelfde principe als HVAC en ECO-SIM)
+bool ignore_callbacks    = false;
+unsigned long last_matter_update = 0;
+
+// =============================================================================
+// Matter endpoints (identiek aan ESP32-C6_ECO-boiler_SIM)
+// =============================================================================
+MatterTemperatureSensor matter_tsun;   // Tsun  — collector  (hernoem "°C Collector")
+MatterTemperatureSensor matter_etoph;  // ETopH — top laag   (hernoem "°C Top")
+MatterTemperatureSensor matter_eboth;  // EBotH — onderste   (hernoem "°C Bodem")
+MatterHumiditySensor    matter_eqpct;  // EQtot als % boilervolheid (hernoem "% Boiler vol")
+MatterFan               matter_pomp;   // Pomp: snelheid + aan/uit  (hernoem "Pomp ECO")
+
+// Timing
+unsigned long last_sensor_read = 0;
+unsigned long last_pump_check = 0;
+unsigned long last_deq_calc = 0;
+unsigned long last_hvac_publish = 0;
+unsigned long uptime_sec = 0;
+unsigned long last_uptime_update = 0;
+
+// Google Sheets logging
+const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwk3jUeZqXGS4OCPyvnN_s1V_9n6RXWZhPn3gtn9ougEeYtTixIraOA_AV7CXVR6cnRgA/exec";  // ← VERVANG!
+const unsigned long GSHEET_LOG_INTERVAL = 10 * 60 * 1000; // 10 minutes
+unsigned long last_gsheet_log = 0;
+
+// WiFi
+bool ap_mode = false;
+int wifi_rssi = 0;
+
+// Network keepalive (v1.6 ping optimalisatie)
+unsigned long last_keepalive = 0;
+const unsigned long KEEPALIVE_INTERVAL = 30000UL;  // 30s unicast TCP naar gateway
+
+// Statistics (daily reset at midnight)
+float yield_today = 0;
+int pump_minutes_today = 0;
+int pump_starts_today = 0;
+unsigned long pump_on_start = 0;
+
+// ============== IN-MEMORY GRAPHING ==============
+#define GRAPH_SAMPLES 60  // 60 samples = 60 minutes @ 1/min
+
+struct GraphData {
+  float tsun[GRAPH_SAMPLES];
+  float tboil[GRAPH_SAMPLES];
+  float dt[GRAPH_SAMPLES];
+  float eqtot[GRAPH_SAMPLES];
+  float deq[GRAPH_SAMPLES];
+  int pwm[GRAPH_SAMPLES];
+  int index;  // Current write position (circular buffer)
+} graph_data;
+
+
+// ============== v1.8: DEBUG LOGGING ==============
+unsigned long boot_time_ms = 0;  // Alleen deze regel houden!
+
+
+// ============== NVS KEYS ==============
+#define NVS_NAMESPACE "eco-config"
+// WiFi & System
+#define NVS_ROOM_ID "room_id"
+#define NVS_WIFI_SSID "wifi_ssid"
+#define NVS_WIFI_PASS "wifi_pass"
+#define NVS_STATIC_IP "static_ip"
+// Pump thresholds
+#define NVS_DT_START "dt_start"
+#define NVS_DT_STOP "dt_stop"
+#define NVS_TSUN_MIN "tsun_min"
+#define NVS_TSUN_OVERHEAT "tsun_overheat"
+#define NVS_TSUN_HIGH "tsun_high"
+#define NVS_MAX_LOSS_STREAK "max_loss"
+// PWM settings
+#define NVS_PWM_MIN "pwm_min"
+#define NVS_PWM_MAX "pwm_max"
+#define NVS_PWM_OVERHEAT "pwm_overheat"
+// Energy calculation
+#define NVS_ETMIN "etmin"
+#define NVS_GLYCOL_PCT "glycol_pct"
+#define NVS_BOILER_VOL "boiler_vol"
+#define NVS_ZONE_VOL_BASE "zone_vol_"
+// Operating hours
+#define NVS_HOUR_START "hour_start"
+#define NVS_HOUR_END "hour_end"
+// HVAC integration
+#define NVS_HVAC_ENABLED "hvac_enabled"
+#define NVS_HVAC_IP "hvac_ip"
+#define NVS_HVAC_MDNS "hvac_mdns"
+#define NVS_HVAC_THRESH "hvac_thresh"
+// Sensor nicknames
+#define NVS_SENSOR_NICK_BASE "sensor_"
+// Simulation
+#define NVS_SIMULATION_MODE "sim_mode"
+
+// ============== FUNCTION DECLARATIONS ==============
+void loadConfig();
+void saveConfig();
+void factoryReset();
+void setupWiFi();
+void setupSensors();
+void setupPump();
+void setupWebServer();
+void readSensors();
+void calculateEnergy();
+void checkPumpLogic();
+void controlPump(bool state, int pwm);
+void publishHVAC();
+void addGraphSample();
+String getMainPage();
+String getSettingsPage();
+String getManualPage();
+String getGraphDataJSON();
+String getFormattedDateTime();
+float readPT1000();
+float calculatePWM(float dT, float Tsun);
+
+
+
+// =============================================================================
+// Matter: PWM ↔ fan speed percentage mapping (identiek aan SIM)
+// =============================================================================
+uint8_t pwm_to_pct(int pwm) {
+  return (uint8_t)constrain((int)round(pwm / 255.0f * 100.0f), 0, 100);
+}
+
+int pct_to_pwm(uint8_t pct) {
+  return constrain((int)round(pct / 100.0f * 255.0f), 0, 255);
+}
+
+uint8_t eq_to_pct(float kWh) {
+  if (EQ_MAX <= 0.0f) return 0;
+  return (uint8_t)constrain((int)round(kWh / EQ_MAX * 100.0f), 0, 100);
+}
+
+// Berekent maximale energieinhoud boiler (Cp=1.16 kWh/m³K, Tref=20°C)
+// Aanroepen na loadConfig() en na /settings wijziging
+float calcEQmax() {
+  return BOILER_VOLUME_TOTAL * 1.16f * (TSUN_HIGH - 20.0f) / 1000.0f;
+}
+
+
+// ============================================================
+// GOOGLE SHEETS LOGGING - MATCHED TO /json ENDPOINT
+// ============================================================
+void logToGoogleSheets() {
+  // Skip if WiFi not connected
+  if (!WiFi.isConnected()) return;
+  
+  // Check interval
+  unsigned long now = millis();
+  if (now - last_gsheet_log < GSHEET_LOG_INTERVAL) return;
+  last_gsheet_log = now;
+  
+  // Get pump message (reuse your existing function!)
+  String pumpMsg = getPumpMessage();
+  pumpMsg.replace("\"", "\\\"");  // Escape quotes for JSON
+  
+  // Build JSON - EXACT SAME FORMAT as /json endpoint
+  char jsonData[600];
+  snprintf(jsonData, sizeof(jsonData), 
+    "{\"uptime\":%lu,"
+    "\"ETopH\":%.1f,\"ETopL\":%.1f,\"EMidH\":%.1f,\"EMidL\":%.1f,"
+    "\"EBotH\":%.1f,\"EBotL\":%.1f,\"EAv\":%.1f,\"EQtot\":%.2f,"
+    "\"Solar\":%.1f,\"dT\":%.1f,\"dEQ\":%.3f,\"pwmVal\":%d,"
+    "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d,"
+    "\"pump_status\":\"%s\",\"yield_today\":%.1f}",
+    uptime_sec,
+    ETopH, ETopL, EMidH, EMidL, EBotH, EBotL, EAv, EQtot,
+    Tsun, dT, dEQ, pwm_value,
+    pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize(),
+    pumpMsg.c_str(), yield_today
+  );
+  
+  // Send HTTP POST
+  HTTPClient http;
+  http.begin(GOOGLE_SCRIPT_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  
+  int httpCode = http.POST(jsonData);
+  
+  // Handle response
+  if (httpCode == 302 || httpCode == 200) {
+    logInfo("GSheet OK");
+  } else if (httpCode > 0) {
+    char msg[50];
+    snprintf(msg, 50, "GSheet HTTP %d", httpCode);
+    logWarn(msg);
+  } else {
+    logError("GSheet timeout");
+  }
+  
+  http.end();
+}
+
+
+
+// =============================================================================
+// Matter: override timeout bewaken (aanvullend op checkPumpLogic — garandeert
+// dat de Matter UI binnen 5s bijgewerkt wordt, niet pas na 60s pump check)
+// =============================================================================
+void check_pump_override() {
+  if (pump_override_active &&
+      millis() - pump_override_start > PUMP_OVERRIDE_DURATION) {
+    pump_override_active = false;
+    pump_override_state  = false;
+    pwm_override         = 0;
+    Serial.println(F("[OVERRIDE] Pomp — vervallen na 60s, terug naar auto"));
+    // Fan UI wordt bijgewerkt in update_matter_sensors() binnen 5s
+  }
+}
+
+
+// =============================================================================
+// Matter: sensor feedback en pompstatus pushen naar HomeKit
+// Gebruikt pwm_override bij actieve override voor directe UI-feedback,
+// anders pwm_value (de werkelijke waarde vanuit controlPump())
+// =============================================================================
+void update_matter_sensors() {
+  matter_tsun.setTemperature(Tsun);
+  matter_etoph.setTemperature(ETopH);
+  matter_eboth.setTemperature(EBotH);
+  matter_eqpct.setHumidity(eq_to_pct(EQtot));
+
+  // Fan: snelheidsfeedback → HomeKit
+  // ignore_callbacks: voorkomt dat setSpeedPercent() de onChangeSpeedPercent
+  // callback triggert en een nieuwe override aanmaakt (SIM-patroon)
+  ignore_callbacks = true;
+  int effective_pwm = pump_override_active ? pwm_override : pwm_value;
+  matter_pomp.setSpeedPercent(pwm_to_pct(effective_pwm));
+  ignore_callbacks = false;
+}
+
+
+// =========
+// SETUP
+// =========
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  boot_time_ms = millis();  // v1.8: Track boot time
+  
+  // v1.8: Initialize SPIFFS for logging
+  if (SPIFFS.begin(true)) {  // true = format if needed
+    Serial.println("SPIFFS mounted OK");
+  } else {
+    Serial.println("WARN SPIFFS mount failed");
+  }
+  
+  Serial.println("\n\n=== ESP32 ECO Controller V1.16 ===");
+  Serial.println("FIX: WiFi power save NA WiFi.begin (timing fix)");
+  
+  // Log boot event
+  char boot_msg[100];
+  snprintf(boot_msg, sizeof(boot_msg), "heap=%dKB", ESP.getFreeHeap()/1024);
+  logEvent("BOOT", boot_msg);
+  
+  // Check for factory reset (type 'R' within 3s)
+  Serial.println("\nFactory reset? Type 'R' within 3 seconds...");
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (Serial.available() && Serial.read() == 'R') {
+      factoryReset();
+      break;
+    }
+  }
+  
+  // Load configuration
+  loadConfig();
+  
+  // Initialize hardware
+  setupPump();
+  setupSensors();
+  
+  // Initialize graph data
+  memset(&graph_data, 0, sizeof(graph_data));
+
+  // Setup WiFi & Web Server
+  setupWiFi();
+  setupWebServer();
+  
+  // ── Matter initialisatie (alleen als WiFi verbonden — niet in AP mode) ────
+  if (!ap_mode) {
+    Serial.println(F("\n── Matter initialisatie ────────────────────────────────"));
+    Serial.printf("EQ_MAX = %.1f kWh (%.0fL, Tsun_high=%.0f°C)\n",
+                  EQ_MAX, BOILER_VOLUME_TOTAL, TSUN_HIGH);
+
+    // Temperatuursensoren + vochtigheidssensor
+    matter_tsun.begin();
+    matter_etoph.begin();
+    matter_eboth.begin();
+    matter_eqpct.begin();
+
+    // MatterFan: pompbediening
+    // FAN_MODE_SEQ_OFF_HIGH: enkel OFF en HIGH als modus-stappen
+    matter_pomp.begin(0, MatterFan::FAN_MODE_OFF, MatterFan::FAN_MODE_SEQ_OFF_HIGH);
+
+    // Speed slider bewogen in Home app → PWM override
+    matter_pomp.onChangeSpeedPercent([](uint8_t new_pct) -> bool {
+      if (ignore_callbacks) return true;
+
+      int pwm = pct_to_pwm(new_pct);
+      pwm_override = pwm;
+
+      if (pwm == 0) {
+        // Snelheid naar 0 → terug naar auto
+        pump_override_active = false;
+        pump_override_state  = false;
+        Serial.println(F("[HomeKit] Pomp speed = 0% → terug naar auto"));
+      } else {
+        // Override activeren — starttijd EERST, dan vlag (race condition fix)
+        pump_override_start  = millis();   // EERST
+        pump_override_active = true;       // DAN
+        pump_override_state  = true;
+        Serial.printf("[HomeKit] Pomp speed override → %d%% = PWM %d\n", new_pct, pwm);
+      }
+      return true;
+    });
+
+    // Mode gewijzigd in Home app (OFF-knop of modus-selectie)
+    matter_pomp.onChangeMode([](uint8_t new_mode) -> bool {
+      if (ignore_callbacks) return true;
+
+      if (new_mode == MatterFan::FAN_MODE_OFF) {
+        // Expliciet UIT gezet → override wissen, terug naar auto
+        pump_override_active = false;
+        pump_override_state  = false;
+        pwm_override         = 0;
+        ignore_callbacks = true;
+        matter_pomp.setSpeedPercent(0);
+        ignore_callbacks = false;
+        Serial.println(F("[HomeKit] Pomp mode OFF → terug naar auto, speed=0"));
+      } else {
+        // Mode AAN zonder specifieke speed → gebruik PWM_MIN
+        if (!pump_override_active) {
+          pwm_override         = PWM_MIN;
+          pump_override_start  = millis();   // EERST
+          pump_override_active = true;       // DAN
+          pump_override_state  = true;
+          ignore_callbacks = true;
+          matter_pomp.setSpeedPercent(pwm_to_pct(PWM_MIN));
+          ignore_callbacks = false;
+          Serial.printf("[HomeKit] Pomp mode AAN → override PWM=%d (%d%%)\n",
+                        PWM_MIN, pwm_to_pct(PWM_MIN));
+        }
+      }
+      return true;
+    });
+
+    // Matter starten
+    Matter.begin();
+
+    // Pairing check
+    Serial.println(F("\n══════════════════════════════════════════"));
+    if (!Matter.isDeviceCommissioned()) {
+      Serial.println(F("MATTER: Nog niet gepaard."));
+      Serial.println(F("► Manuele code:"));
+      Serial.println("    " + Matter.getManualPairingCode());
+      Serial.println(F("► Home app → + → Accessoire → Meer opties → code invoeren"));
+      Serial.println(F("Wacht op commissioning..."));
+      while (!Matter.isDeviceCommissioned()) { delay(500); Serial.print("."); }
+      Serial.println(F("\nGEPAARD!"));
+    } else {
+      Serial.println(F("MATTER: Al gepaard. Typ 'reset-matter' om te wissen."));
+    }
+    Serial.println(F("══════════════════════════════════════════\n"));
+  }
+  // ── Einde Matter initialisatie ────────────────────────────────────────────
+  
+  // NTP time sync
+  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
+  tzset();
+  
+  Serial.println("\n=== Setup Complete ===");
+
+  if (initLogging()) {
+    Serial.println("Logging system initialized");
+  }
+
+  Serial.println("Ready!");
+}
+
+
+
+// ============
+// MAIN LOOP
+// ============
+void loop() {
+  // Handle DNS (if in AP mode)
+  if (ap_mode) {
+    dnsServer.processNextRequest();
+  }
+  
+  // Update uptime
+  if (millis() - last_uptime_update >= 1000) {
+    uptime_sec++;
+    last_uptime_update = millis();
+  }
+  
+  // Read sensors (every 60s)
+  if (millis() - last_sensor_read >= SENSOR_INTERVAL) {
+    readSensors();
+    calculateEnergy();
+    addGraphSample();
+    last_sensor_read = millis();
+  }
+  
+  // Calculate dEQ (every 10 min)
+  if (millis() - last_deq_calc >= DEQ_INTERVAL) {
+    dEQ = EQtot - prev_EQtot;
+    prev_EQtot = EQtot;
+    last_deq_calc = millis();
+    
+    // Update daily yield (only positive gains!)
+    if (dEQ > 0) {
+      yield_today += dEQ;
+    }
+    
+    Serial.printf("dEQ: %.3f kWh/10min (Yield today: %.1f kWh)\n", dEQ, yield_today);
+  }
+  
+  // Check pump logic (every 60s)
+  if (millis() - last_pump_check >= PUMP_CHECK_INTERVAL) {
+    checkPumpLogic();
+    last_pump_check = millis();
+  }
+  
+  // Publish to HVAC (every 5 min, if enabled and threshold met)
+  if (config.hvac_enabled && EQtot > config.hvac_threshold) {
+    if (millis() - last_hvac_publish >= HVAC_PUBLISH_INTERVAL) {
+      publishHVAC();
+      last_hvac_publish = millis();
+    }
+  }
+  
+  // Reset daily stats at midnight
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0 && timeinfo.tm_sec < 2) {
+    yield_today = 0;
+    pump_minutes_today = 0;
+    pump_starts_today = 0;
+  }
+  
+  // Serial test commands (for debugging)
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    // ── Matter serial commando's ─────────────────────────────────────────
+    if (cmd.equalsIgnoreCase("reset-matter")) {
+      Serial.println(F("Matter pairing wissen (instellingen blijven intact)..."));
+      nvs_handle_t h;
+      const char* chip_ns[] = {"chip-factory", "chip-config", "chip-counters", "chip-kvs"};
+      for (int k = 0; k < 4; k++) {
+        if (nvs_open(chip_ns[k], NVS_READWRITE, &h) == ESP_OK) {
+          nvs_erase_all(h);
+          nvs_commit(h);
+          nvs_close(h);
+        }
+      }
+      delay(300);
+      ESP.restart();
+    }
+    else if (cmd.equalsIgnoreCase("reset-all")) {
+      Serial.println(F("Alles wissen (instellingen + Matter) + reboot..."));
+      preferences.begin(NVS_NAMESPACE, false);
+      preferences.clear();
+      preferences.end();
+      nvs_flash_erase();
+      delay(300);
+      ESP.restart();
+    }
+    else if (cmd.equalsIgnoreCase("status")) {
+      Serial.printf("\n=== ECO Status | Uptime: %lu s ===\n", uptime_sec);
+      Serial.printf("Tsun=%.1f°C  ETopH=%.1f°C  EBotH=%.1f°C  EQtot=%.2f kWh (%d%%)\n",
+                    Tsun, ETopH, EBotH, EQtot, eq_to_pct(EQtot));
+      Serial.printf("Pomp: %s  PWM: %d  [%s]\n",
+                    pump_relay ? "AAN" : "UIT", pwm_value,
+                    pump_override_active ? "OVR" : "AUT");
+    }
+    // ── Bestaande char-commando's ────────────────────────────────────────
+    else if (cmd.length() == 1) {
+      switch (cmd[0]) {
+        case 't': // Test sensors
+          Serial.println("\n*** SENSOR TEST ***");
+          readSensors();
+          calculateEnergy();
+          Serial.println("Done!");
+          break;
+          
+        case 'p': // Test pump
+          Serial.println("\n*** PUMP TEST ***");
+          Serial.println("Pump ON (PWM 150)...");
+          controlPump(true, 150);
+          delay(3000);
+          Serial.println("Pump OFF...");
+          controlPump(false, 0);
+          Serial.println("Done!");
+          break;
+          
+        case 'w': // WiFi status
+          Serial.println("\n*** WiFi STATUS ***");
+          Serial.printf("Mode: %s\n", ap_mode ? "AP" : "STA");
+          if (!ap_mode) {
+            Serial.printf("SSID: %s\n", config.wifi_ssid);
+            Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+          } else {
+            Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+          }
+          break;
+          
+        case 'e': // Energy status
+          Serial.println("\n*** ENERGY STATUS ***");
+          Serial.printf("EQtot: %.2f kWh\n", EQtot);
+          Serial.printf("dEQ: %.3f kWh/10min\n", dEQ);
+          Serial.printf("Yield today: %.1f kWh\n", yield_today);
+          break;
+          
+        case 'h': // Help
+          Serial.println("\n*** SERIAL COMMANDS ***");
+          Serial.println("t - Test sensors");
+          Serial.println("p - Test pump");
+          Serial.println("w - WiFi status");
+          Serial.println("e - Energy status");
+          Serial.println("h - This help");
+          Serial.println("reset-matter - Wis Matter pairing");
+          Serial.println("reset-all    - Wis alles + reboot");
+          Serial.println("status       - Matter status");
+          break;
+      }
+    }
+  }
+  
+
+// === WiFi monitoring & keepalive (v1.13) ===
+  
+  // WiFi state monitoring - log ONLY problems
+  static bool was_connected = false;
+  bool is_connected = (WiFi.status() == WL_CONNECTED);
+  
+  // Disconnect detected
+  if (was_connected && !is_connected && !ap_mode) {
+    logError("WIFI disc");
+    WiFi.reconnect();
+  }
+  
+  // Weak signal warning (max 1×/minute)
+  static unsigned long last_signal_warn = 0;
+  if (is_connected && wifi_rssi < -75 && millis() - last_signal_warn > 60000) {
+    char msg[20];
+    snprintf(msg, 20, "WIFI weak r=%d", wifi_rssi);
+    logWarn(msg);
+    last_signal_warn = millis();
+  }
+  
+  was_connected = is_connected;
+  
+  // UDP keepalive - log ONLY failures
+  if (!ap_mode && is_connected && millis() - last_keepalive >= KEEPALIVE_INTERVAL) {
+    WiFiUDP udp;
+    IPAddress gateway = WiFi.gatewayIP();
+    
+    if (gateway != IPAddress(0,0,0,0)) {
+      unsigned long t0 = millis();
+      udp.beginPacket(gateway, 9);
+      udp.write((uint8_t*)"ECO", 3);
+      bool ok = udp.endPacket();
+      unsigned long dt = millis() - t0;
+      
+      wifi_rssi = WiFi.RSSI();
+      
+      // Log ONLY problems
+      if (!ok) {
+        logError("KA timeout");
+      } else if (dt > 50) {
+        char msg[20];
+        snprintf(msg, 20, "KA slow %lums", dt);
+        logWarn(msg);
+      }
+    }
+    
+    last_keepalive = millis();
+  }
+  
+  // Memory check (every 10 min)
+  static unsigned long last_mem_check = 0;
+  if (millis() - last_mem_check > 600000) {
+    uint32_t heap = ESP.getFreeHeap();
+    if (heap < 100000) {
+      char msg[20];
+      snprintf(msg, 20, "MEM low %luK", heap/1024);
+      logWarn(msg);
+    }
+    last_mem_check = millis();
+  }
+  
+    // Google Sheets logging (every 5 minutes)
+    logToGoogleSheets();
+
+  // ── Matter override timeout + periodieke sensor update ───────────────────
+  check_pump_override();
+  if (!ap_mode && millis() - last_matter_update > 5000) {
+    last_matter_update = millis();
+    update_matter_sensors();
+  }
+
+    // yield() ipv delay(100) - WiFi stack fully responsive
+    yield();
+}
+
+
+
+// ===============
+// CONFIGURATION
+// ===============
+void loadConfig() {
+  preferences.begin(NVS_NAMESPACE, false);
+  
+  // System
+  String temp = preferences.getString(NVS_ROOM_ID, "ECO");
+  strncpy(config.room_id, temp.c_str(), sizeof(config.room_id) - 1);
+  
+  // WiFi
+  temp = preferences.getString(NVS_WIFI_SSID, "");
+  strncpy(config.wifi_ssid, temp.c_str(), sizeof(config.wifi_ssid) - 1);
+  
+  temp = preferences.getString(NVS_WIFI_PASS, "");
+  strncpy(config.wifi_pass, temp.c_str(), sizeof(config.wifi_pass) - 1);
+  
+  temp = preferences.getString(NVS_STATIC_IP, "");
+  strncpy(config.static_ip, temp.c_str(), sizeof(config.static_ip) - 1);
+  
+  // HVAC integration
+  temp = preferences.getString(NVS_HVAC_IP, "");
+  strncpy(config.hvac_ip, temp.c_str(), sizeof(config.hvac_ip) - 1);
+  
+  temp = preferences.getString(NVS_HVAC_MDNS, "hvac");
+  strncpy(config.hvac_mdns, temp.c_str(), sizeof(config.hvac_mdns) - 1);
+  
+  config.hvac_enabled = preferences.getBool(NVS_HVAC_ENABLED, true);
+  config.hvac_threshold = preferences.getFloat(NVS_HVAC_THRESH, HVAC_TRANSFER_THRESHOLD);
+  
+  // Pump thresholds
+  DT_START_THRESHOLD = preferences.getFloat(NVS_DT_START, DT_START_THRESHOLD);
+  DT_STOP_THRESHOLD = preferences.getFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
+  TSUN_MIN_TEMP = preferences.getFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
+  TSUN_OVERHEAT = preferences.getFloat(NVS_TSUN_OVERHEAT, TSUN_OVERHEAT);
+  TSUN_HIGH = preferences.getFloat(NVS_TSUN_HIGH, TSUN_HIGH);
+  MAX_LOSS_STREAK = preferences.getInt(NVS_MAX_LOSS_STREAK, MAX_LOSS_STREAK);
+  
+  // PWM settings
+  PWM_MIN = preferences.getInt(NVS_PWM_MIN, PWM_MIN);
+  PWM_MAX = preferences.getInt(NVS_PWM_MAX, PWM_MAX);
+  PWM_OVERHEAT = preferences.getInt(NVS_PWM_OVERHEAT, PWM_OVERHEAT);
+  
+  // Energy calculation
+  ETMIN = preferences.getFloat(NVS_ETMIN, ETMIN);
+  GLYCOL_PERCENT = preferences.getFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
+  BOILER_VOLUME_TOTAL = preferences.getFloat(NVS_BOILER_VOL, BOILER_VOLUME_TOTAL);
+  
+  // Zone volumes
+  for (int i = 0; i < 5; i++) {
+    String key = String(NVS_ZONE_VOL_BASE) + String(i);
+    ZONE_VOLUMES[i] = preferences.getFloat(key.c_str(), ZONE_VOLUMES[i]);
+  }
+  
+  // Operating hours
+  HOUR_START = preferences.getInt(NVS_HOUR_START, HOUR_START);
+  HOUR_END = preferences.getInt(NVS_HOUR_END, HOUR_END);
+  
+  // Sensor nicknames
+  for (int i = 0; i < 6; i++) {
+    String key = String(NVS_SENSOR_NICK_BASE) + String(i);
+    temp = preferences.getString(key.c_str(), sensor_nicknames[i]);
+    sensor_nicknames[i] = temp;
+  }
+  
+  // Copy thresholds to config struct
+  config.dt_start = DT_START_THRESHOLD;
+  config.dt_stop = DT_STOP_THRESHOLD;
+  config.tsun_min = TSUN_MIN_TEMP;
+  config.tsun_overheat = TSUN_OVERHEAT;
+  config.tsun_high = TSUN_HIGH;
+  config.max_loss_streak = MAX_LOSS_STREAK;
+  config.pwm_min = PWM_MIN;
+  config.pwm_max = PWM_MAX;
+  config.pwm_overheat = PWM_OVERHEAT;
+  config.etmin = ETMIN;
+  config.glycol_percent = GLYCOL_PERCENT;
+  config.boiler_volume = BOILER_VOLUME_TOTAL;
+  
+  // Simulation mode
+  SIMULATION_MODE = preferences.getBool(NVS_SIMULATION_MODE, false);
+  
+  // Matter: EQ_MAX herberekenen na laden van volume en TSUN_HIGH
+  EQ_MAX = calcEQmax();
+
+  preferences.end();
+  
+  Serial.println("Configuration loaded from NVS");
+  Serial.printf("Room ID: %s\n", config.room_id);
+  Serial.printf("WiFi SSID: %s\n", strlen(config.wifi_ssid) > 0 ? config.wifi_ssid : "(not configured)");
+  Serial.printf("HVAC: %s\n", config.hvac_enabled ? "Enabled" : "Disabled");
+  
+  // SIMULATION MODE WARNING
+  if (SIMULATION_MODE) {
+    Serial.println("\nWARNING");
+    Serial.println("SIMULATION MODE ACTIVE!");
+    Serial.println("Using FAKE sensor data!");
+    Serial.println("WARNING\n");
+  }
+  
+  Serial.printf("Pump thresholds: dT=%.1f/%.1f, Tsun=%.1f-%.1f-%.1f\n", 
+    DT_START_THRESHOLD, DT_STOP_THRESHOLD, TSUN_MIN_TEMP, TSUN_HIGH, TSUN_OVERHEAT);
+}
+
+void saveConfig() {
+  preferences.begin(NVS_NAMESPACE, false);
+  
+  // System
+  preferences.putString(NVS_ROOM_ID, config.room_id);
+  
+  // WiFi
+  preferences.putString(NVS_WIFI_SSID, config.wifi_ssid);
+  preferences.putString(NVS_WIFI_PASS, config.wifi_pass);
+  preferences.putString(NVS_STATIC_IP, config.static_ip);
+  
+  // HVAC integration
+  preferences.putString(NVS_HVAC_IP, config.hvac_ip);
+  preferences.putString(NVS_HVAC_MDNS, config.hvac_mdns);
+  preferences.putBool(NVS_HVAC_ENABLED, config.hvac_enabled);
+  preferences.putFloat(NVS_HVAC_THRESH, HVAC_TRANSFER_THRESHOLD);
+  
+  // Pump thresholds
+  preferences.putFloat(NVS_DT_START, DT_START_THRESHOLD);
+  preferences.putFloat(NVS_DT_STOP, DT_STOP_THRESHOLD);
+  preferences.putFloat(NVS_TSUN_MIN, TSUN_MIN_TEMP);
+  preferences.putFloat(NVS_TSUN_OVERHEAT, TSUN_OVERHEAT);
+  preferences.putFloat(NVS_TSUN_HIGH, TSUN_HIGH);
+  preferences.putInt(NVS_MAX_LOSS_STREAK, MAX_LOSS_STREAK);
+  
+  // PWM settings
+  preferences.putInt(NVS_PWM_MIN, PWM_MIN);
+  preferences.putInt(NVS_PWM_MAX, PWM_MAX);
+  preferences.putInt(NVS_PWM_OVERHEAT, PWM_OVERHEAT);
+  
+  // Energy calculation
+  preferences.putFloat(NVS_ETMIN, ETMIN);
+  preferences.putFloat(NVS_GLYCOL_PCT, GLYCOL_PERCENT);
+  preferences.putFloat(NVS_BOILER_VOL, BOILER_VOLUME_TOTAL);
+  
+  // Zone volumes
+  for (int i = 0; i < 5; i++) {
+    String key = String(NVS_ZONE_VOL_BASE) + String(i);
+    preferences.putFloat(key.c_str(), ZONE_VOLUMES[i]);
+  }
+  
+  // Operating hours
+  preferences.putInt(NVS_HOUR_START, HOUR_START);
+  preferences.putInt(NVS_HOUR_END, HOUR_END);
+  
+  // Sensor nicknames
+  for (int i = 0; i < 6; i++) {
+    String key = String(NVS_SENSOR_NICK_BASE) + String(i);
+    preferences.putString(key.c_str(), sensor_nicknames[i]);
+  }
+  
+  // Simulation mode
+  preferences.putBool(NVS_SIMULATION_MODE, SIMULATION_MODE);
+  
+  preferences.end();
+  
+  Serial.println("Configuration saved to NVS");
+}
+
+void factoryReset() {
+  Serial.println("\n*** FACTORY RESET ***");
+  preferences.begin(NVS_NAMESPACE, false);
+  preferences.clear();
+  preferences.end();
+  Serial.println("NVS cleared. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+// ===============
+// HARDWARE SETUP
+// ===============
+void setupPump() {
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // OFF (active LOW)
+  pump_relay = false;
+  
+  // PWM (ESP32 core 3.x API)
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(PWM_PIN, 0);
+  pwm_value = 0;
+  
+  Serial.println("Pump control initialized (Relay + PWM)");
+  Serial.printf("  Relay pin: %d (active LOW)\n", RELAY_PIN);
+  Serial.printf("  PWM pin: %d (%d Hz, %d-bit)\n", PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
+}
+
+void setupSensors() {
+  // PT1000 (MAX31865)
+  pt1000.begin(MAX31865_2WIRE);
+  Serial.println("PT1000 sensor initialized (MAX31865 SPI)");
+  Serial.printf("  SPI pins: CS=%d MOSI=%d MISO=%d SCK=%d\n", SPI_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
+  
+  // DS18B20 (1-Wire) - OneWireNg doesn't need explicit init
+  Serial.println("DS18B20 sensors ready (OneWireNg - ESP32-C6 compatible)");
+  Serial.printf("  1-Wire pin: %d\n", ONEWIRE_PIN);
+  Serial.println("  Expected: 6 sensors");
+}
+
+
+// =====================================
+// WIFI SETUP - v1.6 PING OPTIMALISATIE + STATIC IP ondersteuning (v1.7)
+// =====================================
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(config.room_id);
+  
+  if (strlen(config.wifi_ssid) > 0) {
+    Serial.printf("Connecting to '%s'...\n", config.wifi_ssid);
+    
+    // Static IP ondersteuning (optioneel via settings veld)
+    IPAddress local_IP;
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress primaryDNS(8, 8, 8, 8);
+
+    bool useStatic = (strlen(config.static_ip) > 0) && local_IP.fromString(config.static_ip);
+
+    // Leid gateway automatisch af van static IP (vervang laatste octet door 1)
+    // bv. 192.168.1.71 → gateway 192.168.1.1
+    IPAddress gateway(local_IP[0], local_IP[1], local_IP[2], 1);
+
+    if (useStatic) {
+      Serial.printf("Static IP: %s  Gateway (auto): %s\n", config.static_ip, gateway.toString().c_str());
+    } else {
+      Serial.print("Geen static IP → gebruik DHCP ");
+    }
+
+    // Retry logic: 5 attempts @ 20s each
+    int retry_count = 0;
+    const int MAX_RETRIES = 5;
+    bool connected = false;
+    
+    while (!connected && retry_count < MAX_RETRIES) {
+      
+      if (useStatic) {
+        if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+          Serial.println("WiFi.config() MISLUKT! → fallback naar DHCP");
+          logError("WiFi.config() failed - fallback to DHCP");
+          useStatic = false;
+        } else {
+          Serial.println("OK");
+        }
+      }
+
+      WiFi.begin(config.wifi_ssid, config.wifi_pass);
+      
+      if (retry_count == 0) {
+        mac_address = WiFi.macAddress();
+        Serial.println("MAC adres: " + mac_address);
+      }
+      
+      unsigned long start_attempt = millis();
+      
+      while (WiFi.status() != WL_CONNECTED && (millis() - start_attempt) < 20000) {
+        delay(500);
+        Serial.print(".");
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        Serial.println("\nOK WiFi connected!");
+        
+        // CRITICAL: powersave fixes NA connectie
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        Serial.println("✓ WiFi power save: DISABLED (always-online mode)");
+        
+        esp_pm_config_t pm_config = {
+          .max_freq_mhz = 160,
+          .min_freq_mhz = 160,
+          .light_sleep_enable = false
+        };
+        esp_pm_configure(&pm_config);
+        Serial.println("✓ CPU frequency locked at 160MHz (no light sleep)");
+        
+        wifi_config_t wifi_cfg;
+        esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
+        wifi_cfg.sta.listen_interval = 1;
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+        Serial.println("✓ Beacon listen interval: 1 (every beacon)");
+        
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+        Serial.println("✓ All sleep wakeup sources disabled");
+        
+        Serial.println("✓✓✓ PING OPTIMIZATION: FULLY ACTIVE ✓✓✓");
+        
+        char msg[100];
+        snprintf(msg, sizeof(msg), "ip=%s rssi=%d", 
+          WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        logEvent("WIFI_CONN", msg);
+        
+      } else {
+        retry_count++;
+        Serial.printf("\nX Attempt %d/%d failed\n", retry_count, MAX_RETRIES);
+        
+        if (retry_count < MAX_RETRIES) {
+          Serial.println("Disconnecting and retrying...");
+          WiFi.disconnect();
+          delay(2000);
+        }
+      }
+    }
+
+    if (connected) {
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+      
+      if (MDNS.begin(config.room_id)) {
+        Serial.printf("mDNS: http://%s.local\n", config.room_id);
+      }
+      
+      ap_mode = false;
+      return;
+    } else {
+      Serial.println("\nX All WiFi attempts failed -> AP mode");
+    }
+  }
+
+
+
+
+  
+  // Fallback to AP mode
+  Serial.println("X WiFi connection failed");
+  Serial.println("Starting AP mode...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ECO-Setup");
+  
+  IPAddress ap_ip = WiFi.softAPIP();
+  Serial.printf("AP IP: %s\n", ap_ip.toString().c_str());
+  
+  //  CAPTIVE PORTAL DNS (like HVAC!)
+  dnsServer.start(53, "*", ap_ip);
+  Serial.println("\n=== CAPTIVE PORTAL ACTIVE ===");
+  Serial.println("AP SSID: ECO-Setup");
+  Serial.println("DNS: Wildcard redirect to settings page");
+  Serial.println("→ Connect and settings will auto-open!");
+  
+  ap_mode = true;
+}
+
+// ===============
+// SENSOR READING
+// ===============
+float readPT1000() {
+  // Read PT1000 via MAX31865 (manual calculation to avoid freeze bug)
+  uint16_t rtd = pt1000.readRTD();
+  
+  if (rtd == 0 || rtd > 32768) {
+    Serial.println("PT1000 read error");
+    return -127.0;
+  }
+  
+  float ratio = rtd / 32768.0;
+  float resistance = ratio * RREF;
+  float temperature = (resistance - RNOMINAL) / 3.850;  // Linear approximation
+  
+  if (temperature < -50 || temperature > 200 || isnan(temperature)) {
+    Serial.println("PT1000 temperature out of range");
+    return -127.0;
+  }
+  
+  return temperature;
+}
+
+void readSensors() {
+  Serial.println("\n=== Reading Sensors ===");
+  
+  if (SIMULATION_MODE) {
+    // SIMULATION MODE - Generate realistic fake data for testing
+    Serial.println("WARN SIMULATION MODE - Using fake data!");
+    
+    // Simulate realistic solar collector behavior
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    int hour = timeinfo.tm_hour;
+    
+    // Collector temp based on time of day
+    if (hour >= 8 && hour <= 17) {
+      // Daytime - sunny simulation
+      float sun_factor = sin((hour - 8) * 3.14159 / 9.0);  // Peak at 13:00
+      Tsun = 25.0 + sun_factor * 40.0 + random(-20, 20) / 10.0;  // 25-65°C
+    } else {
+      // Night - cool down
+      Tsun = 15.0 + random(-30, 30) / 10.0;  // 12-18°C
+    }
+    
+    // Boiler temps - stratified (hotter at top)
+    ETopH = 60.0 + random(-20, 20) / 10.0;
+    ETopL = 58.0 + random(-20, 20) / 10.0;
+    EMidH = 50.0 + random(-20, 20) / 10.0;
+    EMidL = 48.0 + random(-20, 20) / 10.0;
+    EBotH = 40.0 + random(-20, 20) / 10.0;
+    EBotL = 38.0 + random(-20, 20) / 10.0;
+    
+    Serial.printf("Tsun (FAKE): %.1f°C\n", Tsun);
+    Serial.printf("Boiler (FAKE): TopH=%.1f TopL=%.1f MidH=%.1f MidL=%.1f BotH=%.1f BotL=%.1f\n",
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL);
+    
+  } else {
+    // REAL MODE - Read actual sensors
+    
+    // PT1000 (collector)
+    Tsun = readPT1000();
+    Serial.printf("Tsun (Collector): %.1f°C\n", Tsun);
+    
+    // DS18B20 (boiler) - Manual reading with OneWireNg (ESP32-C6 compatible!)
+    float temps[6];
+    
+    for (int i = 0; i < 6; i++) {
+      // Start conversion
+      ow.reset();
+      ow.writeByte(0x55);  // Match ROM
+      for (int j = 0; j < 8; j++) ow.writeByte(boilerSensors[i][j]);
+      ow.writeByte(0x44);  // Convert T
+      delay(750);  // Wait for conversion
+      
+      // Read scratchpad
+      ow.reset();
+      ow.writeByte(0x55);  // Match ROM
+      for (int j = 0; j < 8; j++) ow.writeByte(boilerSensors[i][j]);
+      ow.writeByte(0xBE);  // Read scratchpad
+      
+      uint8_t data[9];
+      for (int j = 0; j < 9; j++) data[j] = ow.readByte();
+      
+      // CRC check (same algorithm as HVAC)
+      uint8_t crc = 0;
+      for (int j = 0; j < 8; j++) {
+        uint8_t inbyte = data[j];
+        for (int k = 0; k < 8; k++) {
+          uint8_t mix = (crc ^ inbyte) & 0x01;
+          crc >>= 1;
+          if (mix) crc ^= 0x8C;
+          inbyte >>= 1;
+        }
+      }
+      
+      // Validate CRC and convert
+      if (crc == data[8]) {
+        int16_t raw = (data[1] << 8) | data[0];
+        temps[i] = raw / 16.0;
+      } else {
+        temps[i] = -127.0;
+        Serial.printf("WARNING: CRC error on sensor %d\n", i);
+      }
+    }
+    
+    // Assign to global variables
+    ETopH = temps[0];
+    ETopL = temps[1];
+    EMidH = temps[2];
+    EMidL = temps[3];
+    EBotH = temps[4];
+    EBotL = temps[5];
+    
+    Serial.printf("Boiler: TopH=%.1f TopL=%.1f MidH=%.1f MidL=%.1f BotH=%.1f BotL=%.1f\n",
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL);
+  }
+  
+  // Calculate averages (same for both modes)
+  float EAv1 = (ETopH + ETopL) / 2.0;
+  float EAv2 = (ETopL + EMidH) / 2.0;
+  float EAv3 = (EMidH + EMidL) / 2.0;
+  float EAv4 = (EMidL + EBotH) / 2.0;
+  float EAv5 = (EBotH + EBotL) / 2.0;
+  EAv = (EAv1 + EAv2 + EAv3 + EAv4 + EAv5) / 5.0;
+  
+  Serial.printf("EAv: %.1f°C\n", EAv);
+  
+  // Calculate dT
+  Tboil = EBotH;  // Boiler input temperature
+  dT = Tsun - Tboil;
+  Serial.printf("dT: %.1f°C (Tsun - Tboil)\n", dT);
+  
+  // WiFi RSSI
+  if (!ap_mode) {
+    wifi_rssi = WiFi.RSSI();
+  }
+}
+
+void calculateEnergy() {
+  // Calculate energy per zone
+  // Specific heat: Water = 1.163 Wh/L·K, Glycol ~0.9
+  // Adjust for glycol percentage
+  float specific_heat = 1.163 * (1.0 - GLYCOL_PERCENT / 100.0 * 0.23);
+  
+  float EAv1 = (ETopH + ETopL) / 2.0;
+  float EAv2 = (ETopL + EMidH) / 2.0;
+  float EAv3 = (EMidH + EMidL) / 2.0;
+  float EAv4 = (EMidL + EBotH) / 2.0;
+  float EAv5 = (EBotH + EBotL) / 2.0;
+  
+  float EQ1 = (EAv1 - ETMIN) * ZONE_VOLUMES[0] * specific_heat / 1000.0;
+  float EQ2 = (EAv2 - ETMIN) * ZONE_VOLUMES[1] * specific_heat / 1000.0;
+  float EQ3 = (EAv3 - ETMIN) * ZONE_VOLUMES[2] * specific_heat / 1000.0;
+  float EQ4 = (EAv4 - ETMIN) * ZONE_VOLUMES[3] * specific_heat / 1000.0;
+  float EQ5 = (EAv5 - ETMIN) * ZONE_VOLUMES[4] * specific_heat / 1000.0;
+  
+  // Clamp negative values to zero
+  if (EQ1 < 0) EQ1 = 0;
+  if (EQ2 < 0) EQ2 = 0;
+  if (EQ3 < 0) EQ3 = 0;
+  if (EQ4 < 0) EQ4 = 0;
+  if (EQ5 < 0) EQ5 = 0;
+  
+  EQtot = EQ1 + EQ2 + EQ3 + EQ4 + EQ5;
+  
+  Serial.printf("EQtot: %.2f kWh (zones: %.2f, %.2f, %.2f, %.2f, %.2f)\n", 
+    EQtot, EQ1, EQ2, EQ3, EQ4, EQ5);
+}
+
+
+/* =============================
+ * PUMP LOGIC & HELPER FUNCTIONS
+ * ============================= */
+
+// =============================
+// PUMP CONTROL LOGIC
+// =============================
+void checkPumpLogic() {
+  Serial.println("\n=== Pump Logic Check ===");
+  
+  // CHECK OVERRIDE FIRST (like HVAC circuit overrides!)
+  if (pump_override_active) {
+    unsigned long elapsed = millis() - pump_override_start;
+    
+    if (elapsed < PUMP_OVERRIDE_DURATION) {
+      // Override still active
+      unsigned long remaining = (PUMP_OVERRIDE_DURATION - elapsed) / 1000;
+      
+      Serial.printf("WARN OVERRIDE %s (%lu seconds remaining)\n", 
+        pump_override_state ? "ON" : "OFF", remaining);
+      
+      // Apply override state
+      controlPump(pump_override_state, pump_override_state ? PWM_MAX : 0);
+      pump_status = pump_override_state ? "OVERRIDE ON" : "OVERRIDE OFF";
+      
+      return;  // Skip normal logic!
+    } else {
+      // Override expired
+      Serial.println("Override timeout - terug naar AUTO");
+      pump_override_active = false;
+    }
+  }
+  
+  // NORMAL PUMP LOGIC (from Photon)
+  
+  // Get current hour
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  int hour = timeinfo.tm_hour;
+  
+  bool should_run = true;
+  String reason = "OK";
+  
+  // CHECK 1: Night blocking
+  if (hour < HOUR_START || hour >= HOUR_END) {
+    should_run = false;
+    reason = "Night blocking (" + String(hour) + ":00)";
+  }
+  
+  // CHECK 2: dT threshold (with hysteresis)
+  else if (!pump_relay && dT < DT_START_THRESHOLD) {
+    should_run = false;
+    reason = "dT too low (" + String(dT, 1) + "°C < " + String(DT_START_THRESHOLD, 1) + "°C)";
+  }
+  else if (pump_relay && dT < DT_STOP_THRESHOLD) {
+    should_run = false;
+    reason = "dT below stop threshold (" + String(dT, 1) + "°C < " + String(DT_STOP_THRESHOLD, 1) + "°C)";
+  }
+  
+  // CHECK 3: Thermosiphon prevention
+  else if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) {
+    should_run = false;
+    reason = "Thermosiphon risk (Tsun=" + String(Tsun, 1) + "°C < " + String(TSUN_MIN_TEMP, 1) + "°C)";
+  }
+  
+  // CHECK 4: Loss streak
+  else if (should_run && consecutive_reductions >= MAX_LOSS_STREAK) {
+    should_run = false;
+    reason = "Loss streak (" + String(consecutive_reductions) + "× consecutive losses)";
+  }
+  
+  // CHECK 5: Overheat protection (overrides everything!)
+  if (Tsun >= TSUN_OVERHEAT) {
+    should_run = true;
+    reason = "OVERHEAT PROTECTION (Tsun=" + String(Tsun, 1) + "°C >= " + String(TSUN_OVERHEAT, 1) + "°C)";
+  }
+  
+  // Update loss streak
+  if (dEQ > 0) {
+    consecutive_reductions = 0;  // Reset on energy gain
+  } else if (dEQ <= 0 && pump_relay) {
+    consecutive_reductions++;    // Increment on loss while pumping
+  }
+  
+  // Calculate PWM
+  int target_pwm = 0;
+  if (should_run) {
+    target_pwm = calculatePWM(dT, Tsun);
+  }
+  
+  // Apply pump state
+  if (should_run != pump_relay) {
+    // State change
+    if (should_run) {
+      pump_starts_today++;
+      pump_on_start = millis();
+    } else {
+      // Calculate pump minutes
+      if (pump_on_start > 0) {
+        pump_minutes_today += (millis() - pump_on_start) / 60000;
+      }
+    }
+  }
+  
+  controlPump(should_run, target_pwm);
+  pump_status = reason;
+  
+  Serial.printf("Pump: %s (PWM %d/255)\n", should_run ? "ON" : "OFF", target_pwm);
+  Serial.printf("Reason: %s\n", reason.c_str());
+  Serial.printf("Loss streak: %d/%d\n", consecutive_reductions, MAX_LOSS_STREAK);
+}
+
+float calculatePWM(float dT, float Tsun) {
+  // Overheat protection
+  if (Tsun >= TSUN_OVERHEAT) {
+    return PWM_OVERHEAT;
+  }
+  
+  // High temperature (fixed speed)
+  if (Tsun > TSUN_HIGH) {
+    return 180;  // Fixed high speed
+  }
+  
+  // Normal operation (linear mapping)
+  // dT 3-20°C → PWM 80-200
+  float delta = constrain(dT - DT_START_THRESHOLD, 0.0, 17.0);
+  float pwm = PWM_MIN + (delta * (PWM_MAX - PWM_MIN) / 17.0);
+  
+  return (int)pwm;
+}
+
+void controlPump(bool state, int pwm) {
+  pump_relay = state;
+  pwm_value = pwm;
+  
+  // Relay (active LOW)
+  digitalWrite(RELAY_PIN, state ? LOW : HIGH);
+  
+  // PWM (ESP32 core 3.x API)
+  ledcWrite(PWM_PIN, state ? pwm : 0);
+}
+
+// =================
+// HVAC INTEGRATION
+// =================
+void publishHVAC() {
+  if (!config.hvac_enabled) return;
+  if (ap_mode) return;  // Can't publish in AP mode
+  
+  Serial.println("\n=== Publishing to HVAC ===");
+  Serial.printf("EQtot: %.2f kWh (threshold: %.2f kWh)\n", EQtot, config.hvac_threshold);
+  
+  // Try IP first, then mDNS
+  String url = "";
+  if (strlen(config.hvac_ip) > 0) {
+    url = "http://" + String(config.hvac_ip) + "/eco_energy";
+  } else if (strlen(config.hvac_mdns) > 0) {
+    url = "http://" + String(config.hvac_mdns) + ".local/eco_energy";
+  } else {
+    Serial.println("No HVAC target configured");
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  String payload = "eqtot=" + String(EQtot, 2);
+  int httpCode = http.POST(payload);
+  
+  if (httpCode > 0) {
+    Serial.printf("HVAC response: %d\n", httpCode);
+    if (httpCode == 200) {
+      Serial.println("OK HVAC received energy data");
+    }
+  } else {
+    Serial.printf("HVAC publish failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+// =========
+// GRAPHING
+// =========
+void addGraphSample() {
+  // Add current values to circular buffer
+  graph_data.tsun[graph_data.index] = Tsun;
+  graph_data.tboil[graph_data.index] = Tboil;
+  graph_data.dt[graph_data.index] = dT;
+  graph_data.eqtot[graph_data.index] = EQtot;
+  graph_data.deq[graph_data.index] = dEQ;
+  graph_data.pwm[graph_data.index] = pwm_value;
+  
+  graph_data.index = (graph_data.index + 1) % GRAPH_SAMPLES;
+}
+
+String getGraphDataJSON() {
+  String json = "{";
+  
+  // Tsun array
+  json += "\"tsun\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.tsun[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // Tboil array
+  json += "\"tboil\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.tboil[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // dT array
+  json += "\"dt\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.dt[idx], 1);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // EQtot array
+  json += "\"eqtot\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.eqtot[idx], 2);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "],";
+  
+  // PWM array
+  json += "\"pwm\":[";
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (graph_data.index + i) % GRAPH_SAMPLES;
+    json += String(graph_data.pwm[idx]);
+    if (i < GRAPH_SAMPLES - 1) json += ",";
+  }
+  json += "]";
+  
+  json += "}";
+  return json;
+}
+
+// =================
+// HELPER FUNCTIONS
+// =================
+String getFormattedDateTime() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  
+  char buffer[32];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+
+// ======================
+// UI V3 HELPER FUNCTIONS
+// ======================
+
+// Calculate trend (↑↓→)
+String getTrend(float current, float previous, float threshold = 0.1) {
+  if (abs(current - previous) < threshold) return "→";
+  return (current > previous) ? "↑" : "↓";
+}
+
+// Smart pump status message
+String getPumpMessage() {
+  time_t now; struct tm tm; time(&now); localtime_r(&now, &tm); int h = tm.tm_hour;
+  
+  if (pump_override_active) return pump_override_state ? "[MANUAL] Handmatig: Pomp AAN" : "[MANUAL] Handmatig: Pomp UIT";
+  if (Tsun >= TSUN_OVERHEAT) return " OVERVERHITTING - Noodkoeling!";
+  if (h < HOUR_START || h >= HOUR_END) return "[NIGHT] Nacht - systeem rust";
+  
+  if (pump_relay) {
+    if (Tsun > TSUN_HIGH && dT > (DT_START_THRESHOLD + 5)) return " Hoge energie productie! Volle zon!";
+    if (Tsun > (TSUN_OVERHEAT - 5)) return "WARN Preventieve koeling - Collector heet!";
+    if (dT > DT_START_THRESHOLD && Tsun > 40) return " Optimaal laden van boiler";
+    if (pwm_value > 150) return " Energie transport - Hoge snelheid";
+    return " Energie transport actief";
+  } else {
+    if (dEQ < -0.3 && EQtot > 5) return "[WATER] Warm water verbruik - Er wordt gedoucht!";
+    if (consecutive_reductions >= MAX_LOSS_STREAK) return "⏸️ Verliesstreek - Pomp gestopt";
+    if (dT > DT_START_THRESHOLD && Tsun < TSUN_MIN_TEMP) return "[PROTECT] Thermosiphon preventie actief";
+    if (dT < DT_START_THRESHOLD && Tsun > 30) return "⏳ Te weinig verschil - Wachten op meer dT";
+    if (h >= HOUR_START && h < 10 && Tsun < 30) return "[SUNRISE] Collector aan het opwarmen...";
+    if (h >= 18 && h < HOUR_END && Tsun < 40) return "[SUNSET] Zon gaat onder - Productie daalt";
+    if (Tsun < 25) return " Wachten op zon!";
+    return "⏳ Wachten op betere omstandigheden";
+  }
+}
+
+// ============================
+// WEB PAGES - Main Status Page
+// ============================
+String getMainPage() {
+  // Calculate trends (vs 5 min ago)
+  int prev = (graph_data.index - 5 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
+  String tTsun = getTrend(Tsun, graph_data.tsun[prev], 0.5);
+  String tTboil = getTrend(Tboil, graph_data.tboil[prev], 0.5);
+  String tDT = getTrend(dT, graph_data.dt[prev], 0.3);
+  String tEQ = getTrend(EQtot, graph_data.eqtot[prev], 0.05);
+  String msg = getPumpMessage();
+  
+  String html;
+  html.reserve(50000);
+  
+  html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( Status</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;align-items:center;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;margin:8px auto;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:15px;overflow-y:auto;}
+    .section {border:2px solid #369;border-radius:8px;padding:15px;margin-bottom:15px;background:#f9f9f9;}
+    .section-title {font-size:17px;font-weight:bold;color:#369;margin-bottom:10px;border-bottom:2px solid #369;padding-bottom:5px;}
+    table {width:100%;border-collapse:collapse;}
+    td.label {color:#369;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:left;}
+    td.value {background:#e6f0ff;font-size:13px;padding:8px 5px;border-bottom:1px solid #ddd;text-align:center;font-weight:bold;}
+    tr.header-row {background:#336699;color:#fff;}
+    tr.header-row td {color:#fff;font-weight:bold;padding:10px 5px;font-size:12px;}
+    .gauge {width:100%;height:40px;background:#eee;border-radius:5px;position:relative;margin:10px 0;}
+    .gauge-fill {height:100%;background:linear-gradient(90deg, #0a0, #fa0, #c00);border-radius:5px;transition:width 0.5s;}
+    .gauge-label {position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:bold;color:#000;font-size:24px;}
+    .refresh-btn {background:#369;color:#fff;padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold;margin:20px 0;width:100%;max-width:300px;}
+    .refresh-btn:hover {background:#036;}
+    .btn-override {padding:4px 8px;margin:2px;font-size:11px;cursor:pointer;border:none;border-radius:4px;background:#369;color:#fff;}
+    .btn-override:hover {background:#036;}
+    .btn-override-cancel {background:#c00;}
+    .btn-override-cancel:hover {background:#900;}
+    .override-badge {background:#c00;color:#fff;padding:4px 8px;border-radius:4px;font-size:11px;font-weight:bold;}
+    .override-badge-off {background:#666;color:#fff;}
+    .pump-badge {display:inline-block;padding:8px 15px;border-radius:6px;font-weight:bold;margin:10px 0;}
+    .pump-on {background:#0a0;color:#fff;}
+    .pump-off {background:#999;color:#fff;}
+    .status-text {font-size:12px;color:#666;font-style:italic;margin-top:5px;}
+    
+    /* V3 ENHANCEMENTS */
+    .temp-scale {width:100%;height:60px;position:relative;margin:15px 0;}
+    .temp-scale-bar {width:100%;height:30px;background:linear-gradient(90deg,#0af 0%,#0af 23%,#0f0 23%,#0f0 46%,#fa0 46%,#fa0 69%,#f00 69%,#f00 92%,#a00 92%);border-radius:5px;position:relative;}
+    .temp-scale-labels {display:flex;justify-content:space-between;font-size:11px;color:#666;margin-top:5px;}
+    .temp-marker {position:absolute;top:-10px;width:3px;height:50px;background:#000;box-shadow:0 0 5px rgba(0,0,0,0.5);}
+    .temp-marker::after {content:'▼';position:absolute;top:-15px;left:-7px;font-size:16px;color:#000;}
+    .temp-value {position:absolute;top:32px;left:50%;transform:translateX(-50%);background:#000;color:#fff;padding:2px 8px;border-radius:3px;font-size:13px;font-weight:bold;white-space:nowrap;}
+    .trend {font-size:18px;margin-left:5px;color:#369;}
+    .smart-status {background:#e6f0ff;border-left:4px solid #369;padding:10px 15px;margin:10px 0;font-size:14px;font-weight:bold;color:#369;border-radius:4px;}
+    .chart-box {background:#fff;padding:10px;border-radius:8px;border:1px solid #ddd;margin:15px 0;}
+    canvas {width:100%!important;height:200px!important;}
+    
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">)rawliteral" + String(uptime_sec) + " s &nbsp; " + getFormattedDateTime() + R"rawliteral(</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/" class="active">Status</a>
+      <a href="/update">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
+    </div>
+    <div class="main">
+      )rawliteral";
+  
+  // RED WARNING if simulation mode
+  if (SIMULATION_MODE) {
+    html += R"rawliteral(
+      <div style="background:#c00;color:#fff;padding:15px;margin:0 0 15px 0;border-radius:8px;text-align:center;font-weight:bold;font-size:18px;">
+        SIMULATION MODE - FAKE DATA!
+      </div>
+    )rawliteral";
+  }
+  
+  html += R"rawliteral(
+      
+      <!-- Collector Temperature with SCALE -->
+      <div class="section">
+        <div class="section-title"> COLLECTOR (Dak) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></div>
+        <div class="temp-scale">
+          <div class="temp-scale-bar">
+            <div class="temp-marker" style="left:)rawliteral" + String(constrain((Tsun + 10) * 100.0 / 130.0, 0, 100)) + R"rawliteral(%;">
+              <div class="temp-value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</div>
+            </div>
+          </div>
+          <div class="temp-scale-labels">
+            <span>-10°C<br> IJskoud</span>
+            <span>20°C<br> Koud</span>
+            <span>50°C<br> Warm</span>
+            <span>80°C<br> Heet</span>
+            <span>120°C<br> Gevaar</span>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Temperature Differential -->
+      <div class="section">
+        <div class="section-title"> TEMPERATUURVERSCHIL (dT) <span class="trend">)rawliteral" + tDT + R"rawliteral(</span></div>
+        <table>
+          <tr><td class="label">Collector (Tsun) <span class="trend">)rawliteral" + tTsun + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tsun, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Boiler input (Tboil) <span class="trend">)rawliteral" + tTboil + R"rawliteral(</span></td><td class="value">)rawliteral" + String(Tboil, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Verschil (dT)</td><td class="value" style="font-size:18px;color:)rawliteral" + 
+            String(dT > DT_START_THRESHOLD ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dT, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Threshold</td><td class="value">Start: )rawliteral" + String(DT_START_THRESHOLD, 1) + 
+            R"rawliteral(°C, Stop: )rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral(°C</td></tr>
+        </table>
+      </div>
+      
+      <!-- Pump Status with Override Controls -->
+      <div class="section">
+        <div class="section-title"> POMP STATUS</div>
+        <div class="smart-status">)rawliteral" + msg + R"rawliteral(</div>
+        <div style="text-align:center;">
+          <div class="pump-badge )rawliteral" + String(pump_relay ? "pump-on" : "pump-off") + R"rawliteral(">
+            )rawliteral" + String(pump_relay ? "●  AAN" : "○  UIT") + R"rawliteral(
+          </div>
+          <div style="font-size:24px;font-weight:bold;margin:10px 0;">PWM: )rawliteral" + String(pwm_value) + 
+            R"rawliteral(/255 ()rawliteral" + String(pwm_value * 100 / 255) + R"rawliteral(%)</div>
+          <div class="status-text">)rawliteral" + pump_status + R"rawliteral(</div>
+        </div>
+        <table style="margin-top:15px;">
+          <tr><td class="label">Vandaag gestart</td><td class="value">)rawliteral" + String(pump_starts_today) + R"rawliteral(×</td></tr>
+          <tr><td class="label">Draaitijd vandaag</td><td class="value">)rawliteral" + String(pump_minutes_today) + R"rawliteral( min</td></tr>
+          <tr><td class="label">Loss streak</td><td class="value">)rawliteral" + String(consecutive_reductions) + "/" + 
+            String(MAX_LOSS_STREAK) + R"rawliteral(</td></tr>
+          <tr><td class="label">Override</td><td class="value">)rawliteral";
+  
+  // Pump override buttons with timer
+  if (pump_override_active) {
+    unsigned long elapsed = millis() - pump_override_start;
+    if (elapsed < PUMP_OVERRIDE_DURATION) {
+      unsigned long remaining = (PUMP_OVERRIDE_DURATION - elapsed) / 1000;
+      String badge_class = pump_override_state ? "override-badge" : "override-badge override-badge-off";
+      String badge_text = pump_override_state ? "ON" : "OFF";
+      
+      html += "<span class=\"" + badge_class + " timer\" data-remaining=\"" + String(remaining) + "\">" + 
+              badge_text + " " + String(remaining / 60) + ":" + String(remaining % 60, DEC) + "</span> ";
+      html += "<button class=\"btn-override btn-override-cancel\" onclick=\"cancelPumpOverride()\">×</button>";
+    } else {
+      html += "<button class=\"btn-override\" onclick=\"setPumpOverride(true)\">ON</button> ";
+      html += "<button class=\"btn-override\" onclick=\"setPumpOverride(false)\">OFF</button>";
+    }
+  } else {
+    html += "<button class=\"btn-override\" onclick=\"setPumpOverride(true)\">ON</button> ";
+    html += "<button class=\"btn-override\" onclick=\"setPumpOverride(false)\">OFF</button>";
+  }
+  
+  html += R"rawliteral(
+          </td></tr>
+        </table>
+      </div>
+      
+      <!-- Boiler Energy -->
+      <div class="section">
+        <div class="section-title"> BOILER ENERGIE <span class="trend">)rawliteral" + tEQ + R"rawliteral(</span></div>
+        <div style="text-align:center;font-size:36px;font-weight:bold;color:#369;margin:10px 0;">)rawliteral" + 
+          String(EQtot, 2) + R"rawliteral( kWh</div>
+        <div class="gauge">
+          <div class="gauge-fill" style="width:)rawliteral" + String(constrain(EQtot * 100 / 25, 0, 100)) + R"rawliteral(%;background:#369;"></div>
+        </div>
+        <table style="margin-top:15px;">
+          <tr><td class="label">Gemiddelde temp (EAv)</td><td class="value">)rawliteral" + String(EAv, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">Energie verandering (dEQ)</td><td class="value" style="color:)rawliteral" + 
+            String(dEQ > 0 ? "#0a0" : "#c00") + R"rawliteral(;">)rawliteral" + String(dEQ, 3) + R"rawliteral( kWh/10min</td></tr>
+          <tr><td class="label">Opbrengst vandaag</td><td class="value">)rawliteral" + String(yield_today, 1) + R"rawliteral( kWh</td></tr>
+        </table>
+      </div>
+      
+      <!-- Boiler Temperatures - ALL 6 -->
+      <div class="section">
+        <div class="section-title"> BOILER TEMPERATUREN</div>
+        <table>
+          <tr class="header-row"><td>Zone</td><td>Temperatuur</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[0] + R"rawliteral(</td><td class="value">)rawliteral" + String(ETopH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[1] + R"rawliteral(</td><td class="value">)rawliteral" + String(ETopL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[2] + R"rawliteral(</td><td class="value">)rawliteral" + String(EMidH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[3] + R"rawliteral(</td><td class="value">)rawliteral" + String(EMidL, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[4] + R"rawliteral(</td><td class="value">)rawliteral" + String(EBotH, 1) + R"rawliteral(°C</td></tr>
+          <tr><td class="label">)rawliteral" + sensor_nicknames[5] + R"rawliteral(</td><td class="value">)rawliteral" + String(EBotL, 1) + R"rawliteral(°C</td></tr>
+        </table>
+      </div>
+      
+      <!-- Live Charts -->
+      <div class="section">
+        <div class="section-title"> LIVE GRAFIEKEN (60 minuten)</div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Temperaturen</h3>
+        <div class="chart-box"><canvas id="tempChart"></canvas></div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Energie</h3>
+        <div class="chart-box"><canvas id="energyChart"></canvas></div>
+        <h3 style="color:#369;margin:15px 0 5px 0;font-size:15px;">Pomp</h3>
+        <div class="chart-box"><canvas id="pumpChart"></canvas></div>
+      </div>
+      
+      <!-- System Status -->
+      <div class="section">
+        <div class="section-title"> SYSTEEM</div>
+        <table>
+          <tr><td class="label">WiFi IP</td><td class="value">)rawliteral" + (ap_mode ? "AP: " + WiFi.softAPIP().toString() : WiFi.localIP().toString()) + R"rawliteral(</td></tr>
+          <tr><td class="label">mDNS naam</td><td class="value">http://)rawliteral" + String(config.room_id) + R"rawliteral(.local</td></tr>
+          <tr><td class="label">WiFi RSSI</td><td class="value">)rawliteral" + String(wifi_rssi) + R"rawliteral( dBm</td></tr>
+          <tr><td class="label">Free heap</td><td class="value">)rawliteral" + String((ESP.getFreeHeap() * 100) / ESP.getHeapSize()) + R"rawliteral(%</td></tr>
+          <tr><td class="label">Uptime</td><td class="value">)rawliteral" + String(uptime_sec / 3600) + R"rawliteral(u )rawliteral" + String((uptime_sec % 3600) / 60) + R"rawliteral(m</td></tr>
+        </table>
+      </div>
+      
+      <!-- Refresh Button -->
+      <div style="text-align:center;">
+        <button class="refresh-btn" onclick="location.reload()"> Refresh</button>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    function setPumpOverride(state) {
+      const endpoint = state ? '/pump_override_on' : '/pump_override_off';
+      fetch(endpoint).then(() => setTimeout(() => location.reload(), 500));
+    }
+    
+    // Render charts
+    fetch('/graph_data').then(r => r.json()).then(d => {
+      const labels = Array.from({length: 60}, (_, i) => `-${60-i}m`);
+      new Chart(document.getElementById('tempChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [
+          {label: 'Tsun', data: d.tsun, borderColor: '#f90', tension: 0.3},
+          {label: 'Tboil', data: d.tboil, borderColor: '#36f', tension: 0.3},
+          {label: 'dT', data: d.dt, borderColor: '#0a0', tension: 0.3}
+        ]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {title: {display: true, text: '°C'}}}}
+      });
+      new Chart(document.getElementById('energyChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [{label: 'EQtot', data: d.eqtot, borderColor: '#c00', tension: 0.3}]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {title: {display: true, text: 'kWh'}}}}
+      });
+      new Chart(document.getElementById('pumpChart'), {
+        type: 'line',
+        data: {labels: labels, datasets: [{label: 'PWM', data: d.pwm, borderColor: '#369', stepped: true, fill: true}]},
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'top'}}, scales: {y: {min: 0, max: 255, title: {display: true, text: 'PWM'}}}}
+      });
+    }).catch(e => console.error('Chart:', e));
+    
+    function cancelPumpOverride() {
+      fetch('/pump_override_cancel').then(() => setTimeout(() => location.reload(), 500));
+    }
+    
+    // Timer countdown (like HVAC)
+    setInterval(() => {
+      document.querySelectorAll('.timer').forEach(badge => {
+        let remaining = parseInt(badge.dataset.remaining);
+        if (remaining > 0) {
+          remaining--;
+          badge.dataset.remaining = remaining;
+          const state = badge.textContent.split(' ')[0];
+          badge.textContent = state + ' ' + Math.floor(remaining/60) + ':' + (remaining%60).toString().padStart(2,'0');
+        } else if (remaining === 0) {
+          setTimeout(() => location.reload(), 1000);
+        }
+      });
+    }, 1000);
+    
+    // Auto-refresh every 30s
+    setTimeout(() => location.reload(), 30000);
+  </script>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+// ==========================
+// WEB PAGES - Settings Page
+// ==========================
+
+String getSettingsPage() {
+  // Build sensor nicknames HTML
+  String sensorNamesHtml = "";
+  for (int i = 0; i < 6; i++) {
+    sensorNamesHtml += "<label style=\"display:block;margin:6px 0;\">" + sensor_nicknames[i] + ": ";
+    sensorNamesHtml += "<input type=\"text\" name=\"sensor_nick_" + String(i) + "\" value=\"" + sensor_nicknames[i] + "\" style=\"width:220px;\"></label>";
+  }
+  
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>)rawliteral" + String(config.room_id) + R"rawliteral( - Settings</title>
+<style>
+body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+.header{display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+.header-left{flex:1;}
+.header-right{flex:1;text-align:right;font-size:15px;}
+.container{display:flex;min-height:calc(100vh - 60px);}
+.sidebar{width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+.sidebar a{display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+.sidebar a:hover{background:#036;}
+.sidebar a.active{background:#c00;}
+.main{flex:1;padding:20px;overflow-y:auto;}
+h2{color:#369;border-bottom:2px solid #369;padding-bottom:10px;}
+.warning{background:#ffe6e6;border:2px solid #c00;padding:15px;margin:20px 0;border-radius:8px;text-align:center;font-weight:bold;color:#900;}
+table{width:100%;margin:15px 0;}
+td{padding:10px;}
+input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
+.btn{background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:20px 10px;}
+.btn:hover{background:#036;}
+@media (max-width: 600px) {
+  .container{flex-direction:column;}
+  .sidebar{width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+  .sidebar a{width:60px;margin:0 3px;}
+  .main{padding:8px;}
+}
+</style></head><body>
+<div class="header">
+  <div class="header-left">)rawliteral" + String(config.room_id) + R"rawliteral(</div>
+  <div class="header-right">Instellingen</div>
+</div>
+<div class="container">
+  <div class="sidebar">
+    <a href="/">Status</a>
+    <a href="/update">OTA</a>
+    <a href="/json">JSON</a>
+    <a href="/settings" class="active">Settings</a>
+  </div>
+  <div class="main">
+<div class="warning">OPGEPAST: Wijzigt permanente instellingen!<br>Verkeerde WiFi kan controller onbereikbaar maken!<br><br><strong>Geen WiFi?</strong> Controller start AP: ECO-Setup<br>Ga naar http://192.168.4.1/settings</div>
+
+
+<!-- MAC ADRES BOX -->
+<div style="background:#e6f0ff;border:3px solid #336699;padding:20px;margin:20px;border-radius:8px;text-align:center;">
+  <h3 style="margin:0 0 10px 0;color:#336699;"> Controller MAC Adres</h3>
+  <div style="font-size:20px;font-weight:bold;color:#003366;font-family:monospace;background:#fff;padding:10px;border-radius:4px;display:inline-block;margin:10px 0;border:2px solid #336699;">)rawliteral" + mac_address + R"rawliteral(</div>
+  <div style="font-size:13px;color:#666;margin-top:10px;">Kopieer dit MAC-adres voor DHCP-reservering in je router</div>
+</div>
+
+<!-- AANBEVOLEN 'Fixed IP' CONFIGURATIE -->
+<div style="background:#fffacd;border:2px solid #336699;padding:15px;margin:20px;border-radius:8px;font-size:14px;">
+  <h4 style="margin:0 0 10px 0;color:#336699;"> Aanbevolen: DHCP met MAC-reservering</h4>
+  <ol style="margin:10px 0;padding-left:25px;line-height:1.6;">
+    <li>Kopieer dit MAC-adres</li>
+    <li>Log in op je router (meestal 192.168.1.1)</li>
+    <li>Ga naar: LAN → DHCP Server → Manual Assignment</li>
+    <li>Voeg toe: MAC-adres + gewenst IP (bijv. 192.168.1.99)</li>
+    <li>Laat hieronder het "Static IP" veld <strong>LEEG</strong></li>
+    <li>Sla op en reboot de controller</li>
+  </ol>
+</div>
+
+
+<form action="/save_settings" method="get">
+  
+  <h2>WiFi Configuratie</h2>
+  <table>
+    <tr><td style="width:35%;">WiFi SSID</td><td><input type="text" name="wifi_ssid" value=")rawliteral" + String(config.wifi_ssid) + R"rawliteral("></td></tr>
+    <tr><td>WiFi Password</td><td><input type="password" name="wifi_pass" value=")rawliteral" + String(config.wifi_pass) + R"rawliteral("></td></tr>
+    <tr><td>Static IP</td><td><input type="text" name="static_ip" value=")rawliteral" + String(config.static_ip) + R"rawliteral(" placeholder="leeg = DHCP"></td></tr>
+  </table>
+
+  <h2>Basis Instellingen</h2>
+  <table>
+    <tr><td style="width:35%;">Room naam</td><td><input type="text" name="room_id" value=")rawliteral" + String(config.room_id) + R"rawliteral(" required></td></tr>
+  </table>
+
+  <h2>Pump Thresholds</h2>
+  <table>
+    <tr><td style="width:35%;">dT Start (&deg;C)</td><td><input type="number" step="0.1" name="dt_start" value=")rawliteral" + String(DT_START_THRESHOLD, 1) + R"rawliteral("></td></tr>
+    <tr><td>dT Stop (&deg;C)</td><td><input type="number" step="0.1" name="dt_stop" value=")rawliteral" + String(DT_STOP_THRESHOLD, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun Minimum (&deg;C)</td><td><input type="number" step="0.1" name="tsun_min" value=")rawliteral" + String(TSUN_MIN_TEMP, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun Overheat (&deg;C)</td><td><input type="number" step="0.1" name="tsun_overheat" value=")rawliteral" + String(TSUN_OVERHEAT, 1) + R"rawliteral("></td></tr>
+    <tr><td>Tsun High (&deg;C)</td><td><input type="number" step="0.1" name="tsun_high" value=")rawliteral" + String(TSUN_HIGH, 1) + R"rawliteral("></td></tr>
+    <tr><td>Max Loss Streak</td><td><input type="number" name="max_loss_streak" value=")rawliteral" + String(MAX_LOSS_STREAK) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>PWM Settings</h2>
+  <table>
+    <tr><td style="width:35%;">PWM Minimum</td><td><input type="number" name="pwm_min" value=")rawliteral" + String(PWM_MIN) + R"rawliteral("></td></tr>
+    <tr><td>PWM Maximum</td><td><input type="number" name="pwm_max" value=")rawliteral" + String(PWM_MAX) + R"rawliteral("></td></tr>
+    <tr><td>PWM Overheat</td><td><input type="number" name="pwm_overheat" value=")rawliteral" + String(PWM_OVERHEAT) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Energy Calculation</h2>
+  <table>
+    <tr><td style="width:35%;">ETmin (&deg;C)</td><td><input type="number" step="0.1" name="etmin" value=")rawliteral" + String(ETMIN, 1) + R"rawliteral("></td></tr>
+    <tr><td>Glycol % (0-50)</td><td><input type="number" step="1" name="glycol_pct" value=")rawliteral" + String(GLYCOL_PERCENT, 0) + R"rawliteral("></td></tr>
+    <tr><td>Total Volume (L)</td><td><input type="number" step="1" name="boiler_volume" value=")rawliteral" + String(BOILER_VOLUME_TOTAL, 0) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Zone Volumes (Liters)</h2>
+  <table>
+    <tr><td style="width:35%;">Zone 1 (Top)</td><td><input type="number" step="1" name="zone_vol_0" value=")rawliteral" + String(ZONE_VOLUMES[0], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 2</td><td><input type="number" step="1" name="zone_vol_1" value=")rawliteral" + String(ZONE_VOLUMES[1], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 3</td><td><input type="number" step="1" name="zone_vol_2" value=")rawliteral" + String(ZONE_VOLUMES[2], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 4</td><td><input type="number" step="1" name="zone_vol_3" value=")rawliteral" + String(ZONE_VOLUMES[3], 0) + R"rawliteral("></td></tr>
+    <tr><td>Zone 5 (Bottom)</td><td><input type="number" step="1" name="zone_vol_4" value=")rawliteral" + String(ZONE_VOLUMES[4], 0) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>HVAC Integration</h2>
+  <table>
+    <tr><td style="width:35%;">HVAC Enabled</td><td><input type="checkbox" name="hvac_enabled" value="1")rawliteral" + String(config.hvac_enabled ? " checked" : "") + R"rawliteral(></td></tr>
+    <tr><td>HVAC IP adres</td><td><input type="text" name="hvac_ip" value=")rawliteral" + String(config.hvac_ip) + R"rawliteral("></td></tr>
+    <tr><td>HVAC mDNS naam</td><td><input type="text" name="hvac_mdns" value=")rawliteral" + String(config.hvac_mdns) + R"rawliteral(" placeholder="ZONDER .local"></td></tr>
+    <tr><td>Transfer Threshold (kWh)</td><td><input type="number" step="0.1" name="hvac_thresh" value=")rawliteral" + String(HVAC_TRANSFER_THRESHOLD, 1) + R"rawliteral("></td></tr>
+  </table>
+
+  <h2>Operating Hours</h2>
+  <table>
+    <tr><td style="width:35%;">Start Hour</td><td><input type="number" min="0" max="23" name="hour_start" value=")rawliteral" + String(HOUR_START) + R"rawliteral("></td></tr>
+    <tr><td>End Hour</td><td><input type="number" min="0" max="23" name="hour_end" value=")rawliteral" + String(HOUR_END) + R"rawliteral("></td></tr>
+  </table>
+
+
+
+
+    <h2> Diagnostics & Logging</h2>
+    <div style="background:#f5f5f5;padding:15px;margin:10px 0;border-left:4px solid #2196f3;">
+      <p><strong>System Logs:</strong></p>
+      <a href="/log/view" class="btn" style="display:inline-block;margin:5px;"> View Log</a>
+      <a href="/log" class="btn" style="display:inline-block;margin:5px;"> Download</a>
+      <a href="/log/clear" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Clear log?')"> Clear</a>
+      <a href="/restart" class="btn" style="display:inline-block;margin:5px;" onclick="return confirm('Restart ESP32?')"> Restart</a>
+      
+      <div style="background:#e8f5e9;padding:10px;margin-top:10px;border-left:4px solid #4caf50;">
+        <strong> Logging Philosophy:</strong>
+        <ul style="margin:5px 0;padding-left:20px;">
+          <li><strong>Empty log = healthy system</strong> (no issues detected)</li>
+          <li>WARN Warning = monitor (not critical)</li>
+          <li>ERR Error = needs attention</li>
+          <li> Info = rare important events</li>
+        </ul>
+      </div>
+    </div>
+    
+    <h3> Log Event Reference</h3>
+    <table style="font-family:monospace;font-size:12px;width:100%;">
+      <tr><td style="width:180px;">ERR WIFI disc</td><td>WiFi disconnected (auto-reconnecting)</td></tr>
+      <tr><td>WARN WIFI weak r=X</td><td>Weak signal (RSSI &lt; -75 dBm)</td></tr>
+      <tr><td>ERR KA timeout</td><td>Keepalive failed (network issue)</td></tr>
+      <tr><td>WARN KA slow Xms</td><td>Keepalive &gt;50ms (potential issue)</td></tr>
+      <tr><td>WARN MEM low XK</td><td>Free heap &lt;100KB (memory low)</td></tr>
+    </table>
+
+  <h2 style="color:#c00;">SIMULATION MODE!</h2>
+  <div style="background:#ffe6e6;border:3px solid #c00;padding:20px;margin:15px 0;border-radius:8px;">
+    <p style="color:#c00;font-weight:bold;font-size:16px;margin:0 0 10px 0;">WAARSCHUWING: ALLEEN VOOR TESTING!</p>
+    <p style="margin:0 0 10px 0;">NEP sensor data. <strong>NIET voor productie!</strong></p>
+    <label style="display:block;margin:10px 0;">
+      <input type="checkbox" name="simulation_mode" value="1")rawliteral" + String(SIMULATION_MODE ? " checked" : "") + R"rawliteral( style="width:auto;">
+      <strong style="color:#c00;">Activeer simulation mode</strong>
+    </label>
+    <p style="font-size:12px;color:#666;margin:10px 0 0 0;">In simulatie mode worden ALLE sensors genegeerd!</p>
+  </div>
+
+  <h2>Sensor Nicknames</h2>
+  <div style="padding:10px;">)rawliteral" + sensorNamesHtml + R"rawliteral(</div>
+
+  <div style="text-align:center;">
+    <button type="submit" class="btn">Opslaan & Reboot</button>
+    <a href="/" class="btn" style="display:inline-block;text-decoration:none;background:#c00;">Annuleren</a>
+  </div>
+</form>
+</div></div>
+</body></html>
+)rawliteral";
+  
+  return html;
+}
+
+
+String getManualPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - Manual</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:20px;overflow-y:auto;}
+    h2 {color:#369;}
+    .btn {background:#369;color:#fff;padding:12px 30px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin:10px;}
+    .btn:hover {background:#036;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">Manual Control</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/">Status</a>
+      <a href="/update">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
+    </div>
+    <div class="main">
+      <h2>Manual Pump Control</h2>
+      <p>Override buttons available on main Status page.</p>
+      <div style="text-align:center;">
+        <a href="/" class="btn">← Terug naar Status</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+// ============================
+// WEB SERVER SETUP & ENDPOINTS
+// ============================
+void setupWebServer() {
+  // =================================
+  // CAPTIVE PORTAL - Like HVAC V53.4!
+  // =================================
+  // Redirect all unknown requests to /settings in AP mode
+  server.onNotFound([](AsyncWebServerRequest *request){
+    if (ap_mode) {
+      Serial.printf("Captive portal: Redirecting %s to /settings\n", request->url().c_str());
+      request->redirect("/settings");
+    } else {
+      request->send(404, "text/plain", "Not found");
+    }
+  });
+  
+  // Main page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", getMainPage());
+  });
+  
+  // Settings page
+  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Captive portal redirect in AP mode
+    if (ap_mode && request->host() != WiFi.softAPIP().toString()) {
+      request->redirect("http://" + WiFi.softAPIP().toString() + "/settings");
+      return;
+    }
+    request->send(200, "text/html", getSettingsPage());
+
+
+});
+  
+  // === v1.13 LOGGING ENDPOINTS ===
+  
+  // View log (HTML)
+  server.on("/log/view", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SPIFFS.begin()) {
+      request->send(500, "text/html", "<h1>SPIFFS Error</h1>");
+      return;
+    }
+    
+    File f = SPIFFS.open("/debug.log", "r");
+    String content = "<html><head><meta charset='utf-8'><title>ECO Log</title>"
+      "<style>body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:20px;}"
+      ".success{background:#1e3a1e;border:2px solid #4caf50;padding:20px;border-radius:8px;text-align:center;color:#4caf50;margin:20px 0;}"
+      "pre{background:#2d2d2d;padding:15px;border-radius:6px;font-size:12px;overflow-x:auto;white-space:pre-wrap;}"
+      ".legend{background:#2d2d2d;padding:10px;border-radius:6px;margin:10px 0;font-size:11px;}"
+      ".legend span{display:inline-block;margin-right:15px;}"
+      "a{color:#4fc3f7;text-decoration:none;}a:hover{text-decoration:underline;}</style></head><body>";
+    
+    content += "<h1> ECO Boiler Log</h1>";
+    content += "<p><a href='/settings'>← Terug naar Settings</a> | <a href='/log'> Download</a> | <a href='/log/clear'> Clear</a></p>";
+    
+    if (!f || f.size() == 0) {
+      content += "<div class='success'><h2> LOG IS EMPTY</h2>"
+        "<p>No issues detected since last boot!</p>"
+        "<p style='font-size:14px;margin-top:10px;'>Empty log = healthy system !</p></div>";
+    } else {
+      content += "<div class='legend'><strong>Legend:</strong> "
+        "<span>WARN = Warning</span> <span>ERR = Error</span> <span> = Info</span></div>";
+      content += "<pre>";
+      while (f.available()) {
+        content += (char)f.read();
+      }
+      content += "</pre>";
+    }
+    
+    if (f) f.close();
+    content += "</body></html>";
+    request->send(200, "text/html", content);
+  });
+  
+  // Download log (raw)
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SPIFFS.begin()) {
+      request->send(500, "text/plain", "SPIFFS Error");
+      return;
+    }
+    File f = SPIFFS.open("/debug.log", "r");
+    if (!f) {
+      request->send(404, "text/plain", "Log file not found");
+      return;
+    }
+    request->send(SPIFFS, "/debug.log", "text/plain");
+    f.close();
+  });
+  
+  // Clear log
+  server.on("/log/clear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (SPIFFS.begin()) {
+      SPIFFS.remove("/debug.log");
+      SPIFFS.remove("/debug.log.old");
+    }
+    request->redirect("/log/view");
+  });
+  
+  // Restart ESP32
+  server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", "<html><body><h1>Rebooting...</h1><p>Refresh in 10 seconds</p></body></html>");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  server.on("/manual", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", getManualPage());
+  });
+  
+  // JSON endpoint (Google Docs compatible - Photon format with uptime first!)
+  server.on("/json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String pumpMsg = getPumpMessage();
+    pumpMsg.replace("\"", "\\\"");  // Escape quotes for JSON
+    
+    char json[600];
+    snprintf(json, sizeof(json), 
+      "{\"uptime\":%lu,"
+      "\"ETopH\":%.1f,\"ETopL\":%.1f,\"EMidH\":%.1f,\"EMidL\":%.1f,"
+      "\"EBotH\":%.1f,\"EBotL\":%.1f,\"EAv\":%.1f,\"EQtot\":%.2f,"
+      "\"Solar\":%.1f,\"dT\":%.1f,\"dEQ\":%.3f,\"pwmVal\":%d,"
+      "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d,"
+      "\"pump_status\":\"%s\",\"yield_today\":%.1f}",
+      uptime_sec,
+      ETopH, ETopL, EMidH, EMidL, EBotH, EBotL, EAv, EQtot,
+      Tsun, dT, dEQ, pwm_value,
+      pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize(),
+      pumpMsg.c_str(), yield_today
+    );
+    request->send(200, "application/json", json);
+  });
+  
+  // Graph data
+  server.on("/graph_data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "application/json", getGraphDataJSON());
+  });
+  
+  // Pump override ON
+  server.on("/pump_override_on", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE ON ===");
+    Serial.println("Duration: 60 seconds");
+    
+    pump_override_active = true;
+    pump_override_state = true;
+    pump_override_start = millis();
+    
+    request->send(200, "text/plain", "Pump override ON (60s)");
+  });
+  
+  // Pump override OFF
+  server.on("/pump_override_off", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE OFF ===");
+    Serial.println("Duration: 60 seconds");
+    
+    pump_override_active = true;
+    pump_override_state = false;
+    pump_override_start = millis();
+    
+    request->send(200, "text/plain", "Pump override OFF (60s)");
+  });
+  
+  // Pump override CANCEL
+  server.on("/pump_override_cancel", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("\n=== PUMP OVERRIDE CANCELLED ===");
+    
+    pump_override_active = false;
+    
+    request->send(200, "text/plain", "Pump override cancelled");
+  });
+  
+  // Reboot
+  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Rebooting...");
+    delay(1000);
+    ESP.restart();
+  });
+  
+  // OTA update page
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>)rawliteral" + String(config.room_id) + R"rawliteral( - OTA</title>
+  <style>
+    body {font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;}
+    .header {display:flex;background:#ffcc00;color:#000;padding:10px 15px;font-size:18px;font-weight:bold;}
+    .header-left {flex:1;}
+    .header-right {flex:1;text-align:right;font-size:15px;}
+    .container {display:flex;min-height:calc(100vh - 60px);}
+    .sidebar {width:80px;padding:10px 5px;background:#fff;border-right:3px solid #c00;}
+    .sidebar a {display:block;background:#369;color:#fff;padding:8px;margin:8px auto;text-decoration:none;font-weight:bold;font-size:12px;border-radius:6px;text-align:center;width:60px;}
+    .sidebar a:hover {background:#036;}
+    .sidebar a.active {background:#c00;}
+    .main {flex:1;padding:20px;overflow-y:auto;text-align:center;}
+    h1 {color:#369;}
+    .button {background:#369;color:#fff;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin:10px;}
+    .button:hover {background:#036;}
+    .reboot {background:#c00;}
+    .reboot:hover {background:#900;}
+    @media (max-width: 600px) {
+      .container {flex-direction:column;}
+      .sidebar {width:100%;border-right:none;border-bottom:3px solid #c00;display:flex;justify-content:center;}
+      .sidebar a {width:60px;margin:0 3px;}
+      .main {padding:8px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">ECO boiler</div>
+    <div class="header-right">OTA Update</div>
+  </div>
+  <div class="container">
+    <div class="sidebar">
+      <a href="/">Status</a>
+      <a href="/update" class="active">OTA</a>
+      <a href="/json">JSON</a>
+      <a href="/settings">Settings</a>
+    </div>
+    <div class="main">
+      <h1>OTA Firmware Update</h1>
+      <form method="POST" action="/update" enctype="multipart/form-data">
+        <input type="file" name="update" accept=".bin"><br><br>
+        <button class="button" type="submit">Upload Firmware</button>
+      </form><br>
+      <button class="button reboot" onclick="if(confirm('Reboot?'))location.href='/reboot'">Reboot</button>
+      <br><br><a href="/" style="color:#369;">← Terug naar Status</a>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+  
+  // OTA update handler
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool success = !Update.hasError();
+    request->send(200, "text/html", success 
+      ? "<h2 style='color:#0f0'>Update OK!</h2><p>Rebooting...</p>" 
+      : "<h2 style='color:#f00'>Update FAILED!</h2>");
+    if (success) { delay(1000); ESP.restart(); }
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    if (!index) {
+      Serial.println("\n=== OTA UPDATE ===");
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    }
+    Update.write(data, len);
+    if (final && Update.end(true)) Serial.println("OTA OK");
+  });
+  
+  // Save settings endpoint
+  server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("\n=== SAVE SETTINGS ===");
+    
+    // WiFi
+    if (request->hasArg("wifi_ssid")) {
+      strncpy(config.wifi_ssid, request->arg("wifi_ssid").c_str(), sizeof(config.wifi_ssid) - 1);
+      Serial.printf("WiFi SSID: %s\n", config.wifi_ssid);
+    }
+    if (request->hasArg("wifi_pass")) {
+      strncpy(config.wifi_pass, request->arg("wifi_pass").c_str(), sizeof(config.wifi_pass) - 1);
+      Serial.println("WiFi Password: ***");
+    }
+    if (request->hasArg("static_ip")) {
+      strncpy(config.static_ip, request->arg("static_ip").c_str(), sizeof(config.static_ip) - 1);
+      Serial.printf("Static IP: %s\n", config.static_ip);
+    }
+    
+    // System
+    if (request->hasArg("room_id")) {
+      strncpy(config.room_id, request->arg("room_id").c_str(), sizeof(config.room_id) - 1);
+      Serial.printf("Room ID: %s\n", config.room_id);
+    }
+    
+    // Pump thresholds
+    if (request->hasArg("dt_start")) {
+      DT_START_THRESHOLD = request->arg("dt_start").toFloat();
+      Serial.printf("dT Start: %.1f\n", DT_START_THRESHOLD);
+    }
+    if (request->hasArg("dt_stop")) {
+      DT_STOP_THRESHOLD = request->arg("dt_stop").toFloat();
+      Serial.printf("dT Stop: %.1f\n", DT_STOP_THRESHOLD);
+    }
+    if (request->hasArg("tsun_min")) {
+      TSUN_MIN_TEMP = request->arg("tsun_min").toFloat();
+      Serial.printf("Tsun Min: %.1f\n", TSUN_MIN_TEMP);
+    }
+    if (request->hasArg("tsun_overheat")) {
+      TSUN_OVERHEAT = request->arg("tsun_overheat").toFloat();
+      Serial.printf("Tsun Overheat: %.1f\n", TSUN_OVERHEAT);
+    }
+    if (request->hasArg("tsun_high")) {
+      TSUN_HIGH = request->arg("tsun_high").toFloat();
+      Serial.printf("Tsun High: %.1f\n", TSUN_HIGH);
+    }
+    if (request->hasArg("max_loss_streak")) {
+      MAX_LOSS_STREAK = request->arg("max_loss_streak").toInt();
+      Serial.printf("Max Loss Streak: %d\n", MAX_LOSS_STREAK);
+    }
+    
+    // PWM settings
+    if (request->hasArg("pwm_min")) {
+      PWM_MIN = request->arg("pwm_min").toInt();
+      Serial.printf("PWM Min: %d\n", PWM_MIN);
+    }
+    if (request->hasArg("pwm_max")) {
+      PWM_MAX = request->arg("pwm_max").toInt();
+      Serial.printf("PWM Max: %d\n", PWM_MAX);
+    }
+    if (request->hasArg("pwm_overheat")) {
+      PWM_OVERHEAT = request->arg("pwm_overheat").toInt();
+      Serial.printf("PWM Overheat: %d\n", PWM_OVERHEAT);
+    }
+    
+    // Energy calculation
+    if (request->hasArg("etmin")) {
+      ETMIN = request->arg("etmin").toFloat();
+      Serial.printf("ETmin: %.1f\n", ETMIN);
+    }
+    if (request->hasArg("glycol_pct")) {
+      GLYCOL_PERCENT = request->arg("glycol_pct").toFloat();
+      Serial.printf("Glycol %%: %.0f\n", GLYCOL_PERCENT);
+    }
+    if (request->hasArg("boiler_volume")) {
+      BOILER_VOLUME_TOTAL = request->arg("boiler_volume").toFloat();
+      Serial.printf("Boiler Volume: %.0f L\n", BOILER_VOLUME_TOTAL);
+    }
+    
+    // Zone volumes
+    for (int i = 0; i < 5; i++) {
+      String param = "zone_vol_" + String(i);
+      if (request->hasArg(param.c_str())) {
+        ZONE_VOLUMES[i] = request->arg(param.c_str()).toFloat();
+        Serial.printf("Zone %d Volume: %.0f L\n", i+1, ZONE_VOLUMES[i]);
+      }
+    }
+    
+    // HVAC integration
+    config.hvac_enabled = request->hasArg("hvac_enabled");
+    Serial.printf("HVAC Enabled: %s\n", config.hvac_enabled ? "Yes" : "No");
+    
+    if (request->hasArg("hvac_ip")) {
+      strncpy(config.hvac_ip, request->arg("hvac_ip").c_str(), sizeof(config.hvac_ip) - 1);
+      Serial.printf("HVAC IP: %s\n", config.hvac_ip);
+    }
+    if (request->hasArg("hvac_mdns")) {
+      String mdns = request->arg("hvac_mdns");
+      mdns.replace(".local", "");
+      mdns.trim();
+      strncpy(config.hvac_mdns, mdns.c_str(), sizeof(config.hvac_mdns) - 1);
+      Serial.printf("HVAC mDNS: %s\n", config.hvac_mdns);
+    }
+    if (request->hasArg("hvac_thresh")) {
+      HVAC_TRANSFER_THRESHOLD = request->arg("hvac_thresh").toFloat();
+      Serial.printf("HVAC Threshold: %.1f kWh\n", HVAC_TRANSFER_THRESHOLD);
+    }
+    
+    // Operating hours
+    if (request->hasArg("hour_start")) {
+      HOUR_START = request->arg("hour_start").toInt();
+      Serial.printf("Hour Start: %d\n", HOUR_START);
+    }
+    if (request->hasArg("hour_end")) {
+      HOUR_END = request->arg("hour_end").toInt();
+      Serial.printf("Hour End: %d\n", HOUR_END);
+    }
+    
+    // Sensor nicknames
+    for (int i = 0; i < 6; i++) {
+      String param = "sensor_nick_" + String(i);
+      if (request->hasArg(param.c_str())) {
+        String nick = request->arg(param.c_str());
+        nick.trim();
+        if (nick.length() > 0 && nick.length() < 50) {
+          sensor_nicknames[i] = nick;
+          Serial.printf("Sensor %d: %s\n", i+1, nick.c_str());
+        }
+      }
+    }
+    
+    // Simulation mode (checkbox)
+    SIMULATION_MODE = request->hasArg("simulation_mode");
+    if (SIMULATION_MODE) {
+      Serial.println("WARN SIMULATION MODE ENABLED!");
+    } else {
+      Serial.println("Simulation mode DISABLED");
+    }
+    
+    // Save to NVS
+    saveConfig();
+    
+    Serial.println("All settings saved to NVS!");
+    request->send(200, "text/html", "<h2 style='text-align:center;color:#369;'> Opgeslagen! Rebooting in 2 seconds...</h2>");
+    delay(2000);
+    ESP.restart();
+  });
+  
+
+
+  server.begin();
+  Serial.println("Web server started");
+}
