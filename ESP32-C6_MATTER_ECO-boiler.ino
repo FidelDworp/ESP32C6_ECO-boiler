@@ -1,4 +1,4 @@
-/* ESP32-C6_MATTER_ECO-boiler.ino - Solar & Fireplace Energy Controller
+/* ESP32-C6_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
 Version 1.18 (1 mar 2026) MATTER integrated
@@ -33,6 +33,7 @@ SIMULATION MODE: Gebruik "HUGE APP 3Mb No OTA" partition!
 #include <OneWireNg_CurrentPlatform.h> // 1-Wire for DS18B20 (ESP32-C6 compatible!)
 #include <WiFiUdp.h>  // ← NIEUW
 #include <nvs.h>
+#include <nvs_flash.h>
 #include <Matter.h>
 #include <MatterEndPoints/MatterTemperatureSensor.h>
 #include <MatterEndPoints/MatterHumiditySensor.h>
