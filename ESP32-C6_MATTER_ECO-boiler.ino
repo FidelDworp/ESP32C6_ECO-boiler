@@ -1,4 +1,4 @@
-/* ESP32-C6_ECO-boiler.ino - Solar & Fireplace Energy Controller
+/* ESP32-C6_MATTER_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
 Version 1.18 (1 mar 2026) MATTER integrated
