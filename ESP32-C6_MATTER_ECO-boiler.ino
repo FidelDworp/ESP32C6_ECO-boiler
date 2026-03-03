@@ -1,7 +1,14 @@
 /* ESP32-C6_MATTER_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
-Version 1.18 (1 mar 2026) MATTER integrated
+Version 1.18 (2 mar 2026) MATTER integrated
+  ✅ 5 Matter endpoints: Tsun, ETopH, EBotH, EQtot (als % boilervolheid), Pomp (fan)
+  ✅ MatterHumiditySensor voor EQtot: EQtot ÷ EQ_MAX_KWH × 100 = % boilervolheid
+     EQ_MAX_KWH instelbaar via /settings (standaard 25 kWh), opgeslagen in NVS
+     Voorbeeld: EQtot=8.45 kWh, EQ_MAX=25 kWh → 34% in Apple Home
+  ✅ MatterFan voor pomp: speed slider ↔ PWM 0–255, 60s override + auto terugval
+  ✅ reset-matter / reset-all / status serial commando's
+  ✅ nvs.h + nvs_flash.h beide geïncludeerd (nvs_flash_erase fix)
 Version 1.17 (26 feb 2026) WiFi FIXED IP in telenet router: Config = 192.168.0.71 (Zie tabel)
 Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
 Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
@@ -243,15 +250,16 @@ const unsigned long PUMP_OVERRIDE_DURATION = 60000UL;  // 60 seconds
 // Matter: gewenste PWM bij override (analoog aan SIM's pwm_override)
 int pwm_override = 0;
 
-// Matter: EQ_MAX voor boilervolheid % (berekend na loadConfig())
-float EQ_MAX = 0.0f;
-
 // Matter: vlaggen (zelfde principe als HVAC en ECO-SIM)
 bool ignore_callbacks    = false;
 unsigned long last_matter_update = 0;
 
+// Matter: maximale boilerenergie (instelbaar via /settings, standaard 25 kWh)
+// EQtot / EQ_MAX_KWH × 100 = % boilervolheid zichtbaar in Apple Home
+float EQ_MAX_KWH = 25.0f;
+
 // =============================================================================
-// Matter endpoints (identiek aan ESP32-C6_ECO-boiler_SIM)
+// Matter endpoints
 // =============================================================================
 MatterTemperatureSensor matter_tsun;   // Tsun  — collector  (hernoem "°C Collector")
 MatterTemperatureSensor matter_etoph;  // ETopH — top laag   (hernoem "°C Top")
@@ -339,6 +347,7 @@ unsigned long boot_time_ms = 0;  // Alleen deze regel houden!
 #define NVS_SENSOR_NICK_BASE "sensor_"
 // Simulation
 #define NVS_SIMULATION_MODE "sim_mode"
+#define NVS_EQ_MAX_KWH      "eq_max_kwh"
 
 // ============== FUNCTION DECLARATIONS ==============
 void loadConfig();
@@ -375,15 +384,12 @@ int pct_to_pwm(uint8_t pct) {
   return constrain((int)round(pct / 100.0f * 255.0f), 0, 255);
 }
 
+// EQtot (kWh) → % boilervolheid: EQtot / EQ_MAX_KWH × 100
+// EQ_MAX_KWH instelbaar via /settings (standaard 25 kWh)
+// Voorbeeld: EQtot=8.45 kWh, EQ_MAX_KWH=25 → 34%
 uint8_t eq_to_pct(float kWh) {
-  if (EQ_MAX <= 0.0f) return 0;
-  return (uint8_t)constrain((int)round(kWh / EQ_MAX * 100.0f), 0, 100);
-}
-
-// Berekent maximale energieinhoud boiler (Cp=1.16 kWh/m³K, Tref=20°C)
-// Aanroepen na loadConfig() en na /settings wijziging
-float calcEQmax() {
-  return BOILER_VOLUME_TOTAL * 1.16f * (TSUN_HIGH - 20.0f) / 1000.0f;
+  if (EQ_MAX_KWH <= 0.0f) return 0;
+  return (uint8_t)constrain((int)round(kWh / EQ_MAX_KWH * 100.0f), 0, 100);
 }
 
 
@@ -468,7 +474,7 @@ void update_matter_sensors() {
   matter_tsun.setTemperature(Tsun);
   matter_etoph.setTemperature(ETopH);
   matter_eboth.setTemperature(EBotH);
-  matter_eqpct.setHumidity(eq_to_pct(EQtot));
+  matter_eqpct.setHumidity(eq_to_pct(EQtot));  // % boilervolheid: EQtot/EQ_MAX_KWH×100
 
   // Fan: snelheidsfeedback → HomeKit
   // ignore_callbacks: voorkomt dat setSpeedPercent() de onChangeSpeedPercent
@@ -531,8 +537,8 @@ void setup() {
   // ── Matter initialisatie (alleen als WiFi verbonden — niet in AP mode) ────
   if (!ap_mode) {
     Serial.println(F("\n── Matter initialisatie ────────────────────────────────"));
-    Serial.printf("EQ_MAX = %.1f kWh (%.0fL, Tsun_high=%.0f°C)\n",
-                  EQ_MAX, BOILER_VOLUME_TOTAL, TSUN_HIGH);
+    Serial.printf("EQ_MAX_KWH = %.1f kWh (max boilerenergie voor %% boilervolheid)\n",
+                  EQ_MAX_KWH);
 
     // Temperatuursensoren + vochtigheidssensor
     matter_tsun.begin();
@@ -945,9 +951,9 @@ void loadConfig() {
   
   // Simulation mode
   SIMULATION_MODE = preferences.getBool(NVS_SIMULATION_MODE, false);
-  
-  // Matter: EQ_MAX herberekenen na laden van volume en TSUN_HIGH
-  EQ_MAX = calcEQmax();
+
+  // Matter: maximale boilerenergie voor % boilervolheid
+  EQ_MAX_KWH = preferences.getFloat(NVS_EQ_MAX_KWH, 25.0f);
 
   preferences.end();
   
@@ -1021,7 +1027,10 @@ void saveConfig() {
   
   // Simulation mode
   preferences.putBool(NVS_SIMULATION_MODE, SIMULATION_MODE);
-  
+
+  // Matter: maximale boilerenergie
+  preferences.putFloat(NVS_EQ_MAX_KWH, EQ_MAX_KWH);
+
   preferences.end();
   
   Serial.println("Configuration saved to NVS");
@@ -2153,6 +2162,16 @@ input,select{padding:8px;border:1px solid #ccc;border-radius:4px;width:100%;}
       <tr><td>WARN MEM low XK</td><td>Free heap &lt;100KB (memory low)</td></tr>
     </table>
 
+  <h2>Matter Instellingen</h2>
+  <table style="width:100%;border-collapse:collapse;">
+    <tr>
+      <td style="padding:8px;width:220px;"><label>Max. boilerenergie (kWh)</label><br>
+        <small style="color:#666;">EQtot ÷ deze waarde = % boilervolheid in Apple Home</small></td>
+      <td style="padding:8px;"><input type="number" name="eq_max_kwh" step="0.5" min="1" max="100"
+        value=")rawliteral" + String(EQ_MAX_KWH, 1) + R"rawliteral(" style="width:100px;"> kWh</td>
+    </tr>
+  </table>
+
   <h2 style="color:#c00;">SIMULATION MODE!</h2>
   <div style="background:#ffe6e6;border:3px solid #c00;padding:20px;margin:15px 0;border-radius:8px;">
     <p style="color:#c00;font-weight:bold;font-size:16px;margin:0 0 10px 0;">WAARSCHUWING: ALLEEN VOOR TESTING!</p>
@@ -2626,6 +2645,13 @@ void setupWebServer() {
       Serial.println("WARN SIMULATION MODE ENABLED!");
     } else {
       Serial.println("Simulation mode DISABLED");
+    }
+    
+    // Matter: max boilerenergie
+    if (request->hasArg("eq_max_kwh")) {
+      EQ_MAX_KWH = request->arg("eq_max_kwh").toFloat();
+      if (EQ_MAX_KWH < 1.0f) EQ_MAX_KWH = 1.0f;  // minimum 1 kWh
+      Serial.printf("EQ_MAX_KWH: %.1f kWh\n", EQ_MAX_KWH);
     }
     
     // Save to NVS
