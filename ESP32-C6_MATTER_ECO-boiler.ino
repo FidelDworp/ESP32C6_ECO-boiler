@@ -1,7 +1,7 @@
 /* ESP32-C6_MATTER_ECO-boiler.ino - Solar & Fireplace Energy Controller
  Author: Fidel Dworp
 
-OPGEPAST: Compileer met "partitions.csv" in de sketchfolder:
+ OPGEPAST: Compileer met "partitions.csv" in de sketchfolder:
 # Name,   Type, SubType, Offset,   Size,    Flags
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
@@ -9,7 +9,8 @@ app0,     app,  ota_0,   0x10000,  0x600000,
 app1,     app,  ota_1,   0x610000, 0x600000,
 spiffs,   data, spiffs,  0xC10000, 0x3F0000,
 
-Version 1.18 (2 mar 2026) MATTER integrated
+Version 1.19 (3 mar 2026) MATTER integrated. Ventilator in home app aangepast aan HVAC versie.
+Version 1.18 (1 mar 2026) MATTER integrated
   ✅ 5 Matter endpoints: Tsun, ETopH, EBotH, EQtot (als % boilervolheid), Pomp (fan)
   ✅ MatterHumiditySensor voor EQtot: EQtot ÷ EQ_MAX_KWH × 100 = % boilervolheid
      EQ_MAX_KWH instelbaar via /settings (standaard 25 kWh), opgeslagen in NVS
@@ -490,6 +491,13 @@ void update_matter_sensors() {
   ignore_callbacks = true;
   int effective_pwm = pump_override_active ? pwm_override : pwm_value;
   matter_pomp.setSpeedPercent(pwm_to_pct(effective_pwm));
+  // In auto mode ook mode updaten (anders bevriest slider op 0 in Home app)
+  // In override mode ongemoeid laten (gebruiker bepaalt via Home app)
+  if (!pump_override_active) {
+    matter_pomp.setMode(effective_pwm > 0
+                        ? MatterFan::FAN_MODE_HIGH
+                        : MatterFan::FAN_MODE_OFF);
+  }
   ignore_callbacks = false;
 }
 
