@@ -9,15 +9,9 @@ app0,     app,  ota_0,   0x10000,  0x600000,
 app1,     app,  ota_1,   0x610000, 0x600000,
 spiffs,   data, spiffs,  0xC10000, 0x3F0000,
 
+Version 1.20 (10 mar 2026) Stuurt ook de HVAC JSON data door naar Google, omdat HVAC dat niet kan. (stack probleem).
 Version 1.19 (3 mar 2026) MATTER integrated. Ventilator in home app aangepast aan HVAC versie.
 Version 1.18 (1 mar 2026) MATTER integrated
-  ✅ 5 Matter endpoints: Tsun, ETopH, EBotH, EQtot (als % boilervolheid), Pomp (fan)
-  ✅ MatterHumiditySensor voor EQtot: EQtot ÷ EQ_MAX_KWH × 100 = % boilervolheid
-     EQ_MAX_KWH instelbaar via /settings (standaard 25 kWh), opgeslagen in NVS
-     Voorbeeld: EQtot=8.45 kWh, EQ_MAX=25 kWh → 34% in Apple Home
-  ✅ MatterFan voor pomp: speed slider ↔ PWM 0–255, 60s override + auto terugval
-  ✅ reset-matter / reset-all / status serial commando's
-  ✅ nvs.h + nvs_flash.h beide geïncludeerd (nvs_flash_erase fix)
 Version 1.17 (26 feb 2026) WiFi FIXED IP in telenet router: Config = 192.168.0.71 (Zie tabel)
 Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
 Version 1.15 (22 jan 2026) Improve connection with browser to UI: in setup(): esp_wifi_set_ps(WIFI_PS_NONE);
@@ -284,10 +278,16 @@ unsigned long last_hvac_publish = 0;
 unsigned long uptime_sec = 0;
 unsigned long last_uptime_update = 0;
 
-// Google Sheets logging
+// Google Sheets logging — ECO boiler
 const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwk3jUeZqXGS4OCPyvnN_s1V_9n6RXWZhPn3gtn9ougEeYtTixIraOA_AV7CXVR6cnRgA/exec";  // ← VERVANG!
 const unsigned long GSHEET_LOG_INTERVAL = 10 * 60 * 1000; // 10 minutes
 unsigned long last_gsheet_log = 0;
+
+// Google Sheets logging — HVAC controller (via ECO als doorstuurder)
+const char* HVAC_JSON_URL   = "http://192.168.0.70/json";
+const char* HVAC_SHEETS_URL = "https://script.google.com/macros/s/AKfycbxHQjdH-i_FWixbteg0ljZkIR-3nhgKefrpPefWjecgBLBASBKnidJ_Zu6i9LvFkgb3/exec";
+const unsigned long HVAC_SHEETS_INTERVAL = 5 * 60 * 1000;  // 5 minuten
+unsigned long last_hvac_sheets_log = 0;
 
 // WiFi
 bool ap_mode = false;
@@ -456,6 +456,47 @@ void logToGoogleSheets() {
   http.end();
 }
 
+
+// =============================================================================
+// HVAC DOORSTUURDER — pollt 192.168.0.70/json en POST naar HVAC Sheets
+// Geen parsing: JSON string wordt rechtstreeks doorgesluisd als payload
+// =============================================================================
+void logHVACToSheets() {
+  if (!WiFi.isConnected()) return;
+  if (millis() - last_hvac_sheets_log < HVAC_SHEETS_INTERVAL) return;
+  last_hvac_sheets_log = millis();
+
+  // Stap 1: Haal HVAC JSON op via plain HTTP
+  HTTPClient httpGet;
+  httpGet.begin(HVAC_JSON_URL);
+  httpGet.setTimeout(5000);
+  int getCode = httpGet.GET();
+
+  if (getCode != 200) {
+    Serial.printf("[HVAC→Sheets] GET mislukt: %d\n", getCode);
+    httpGet.end();
+    return;
+  }
+
+  String payload = httpGet.getString();
+  httpGet.end();
+  Serial.printf("[HVAC→Sheets] GET OK (%d bytes)\n", payload.length());
+
+  // Stap 2: POST payload rechtstreeks door naar Google Sheets
+  HTTPClient httpPost;
+  httpPost.begin(HVAC_SHEETS_URL);
+  httpPost.addHeader("Content-Type", "application/json");
+  httpPost.setTimeout(10000);
+
+  int postCode = httpPost.POST(payload);
+
+  if (postCode == 302 || postCode == 200) {
+    Serial.println("[HVAC→Sheets] POST OK ✓");
+  } else {
+    Serial.printf("[HVAC→Sheets] POST fout: %d\n", postCode);
+  }
+  httpPost.end();
+}
 
 
 // =============================================================================
@@ -872,6 +913,7 @@ void loop() {
   
     // Google Sheets logging (every 5 minutes)
     logToGoogleSheets();
+    logHVACToSheets();
 
   // ── Matter override timeout + periodieke sensor update ───────────────────
   check_pump_override();
