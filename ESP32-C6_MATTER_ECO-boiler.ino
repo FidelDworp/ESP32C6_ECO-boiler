@@ -9,8 +9,8 @@ app0,     app,  ota_0,   0x10000,  0x600000,
 app1,     app,  ota_1,   0x610000, 0x600000,
 spiffs,   data, spiffs,  0xC10000, 0x3F0000,
 
-Version 1.20 (10 mar 2026) Stuurt ook de HVAC JSON data door naar Google, omdat HVAC dat niet kan. (stack probleem).
-Version 1.19 (3 mar 2026) MATTER integrated. Ventilator in home app aangepast aan HVAC versie.
+Version 1.21 (11 mar 2026) Google Sheets logging verwijderd — overgebracht naar Zarlar Dashboard (192.168.0.60). /json endpoint blijft intact.
+Version 1.20 (10 mar 2026) Stuurt nu ook de HVAC JSON data door naar Google, omdat die controller dat niet kan. (memory probleem).
 Version 1.18 (1 mar 2026) MATTER integrated
 Version 1.17 (26 feb 2026) WiFi FIXED IP in telenet router: Config = 192.168.0.71 (Zie tabel)
 Version 1.16 (23 jan 2026) CRITICAL FIX: WiFi power save NA WiFi.begin() (was ervoor!)
@@ -278,17 +278,6 @@ unsigned long last_hvac_publish = 0;
 unsigned long uptime_sec = 0;
 unsigned long last_uptime_update = 0;
 
-// Google Sheets logging — ECO boiler
-const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwk3jUeZqXGS4OCPyvnN_s1V_9n6RXWZhPn3gtn9ougEeYtTixIraOA_AV7CXVR6cnRgA/exec";  // ← VERVANG!
-const unsigned long GSHEET_LOG_INTERVAL = 10 * 60 * 1000; // 10 minutes
-unsigned long last_gsheet_log = 0;
-
-// Google Sheets logging — HVAC controller (via ECO als doorstuurder)
-const char* HVAC_JSON_URL   = "http://192.168.0.70/json";
-const char* HVAC_SHEETS_URL = "https://script.google.com/macros/s/AKfycbxHQjdH-i_FWixbteg0ljZkIR-3nhgKefrpPefWjecgBLBASBKnidJ_Zu6i9LvFkgb3/exec";
-const unsigned long HVAC_SHEETS_INTERVAL = 5 * 60 * 1000;  // 5 minuten
-unsigned long last_hvac_sheets_log = 0;
-
 // WiFi
 bool ap_mode = false;
 int wifi_rssi = 0;
@@ -399,103 +388,6 @@ int pct_to_pwm(uint8_t pct) {
 uint8_t eq_to_pct(float kWh) {
   if (EQ_MAX_KWH <= 0.0f) return 0;
   return (uint8_t)constrain((int)round(kWh / EQ_MAX_KWH * 100.0f), 0, 100);
-}
-
-
-// ============================================================
-// GOOGLE SHEETS LOGGING - MATCHED TO /json ENDPOINT
-// ============================================================
-void logToGoogleSheets() {
-  // Skip if WiFi not connected
-  if (!WiFi.isConnected()) return;
-  
-  // Check interval
-  unsigned long now = millis();
-  if (now - last_gsheet_log < GSHEET_LOG_INTERVAL) return;
-  last_gsheet_log = now;
-  
-  // Get pump message (reuse your existing function!)
-  String pumpMsg = getPumpMessage();
-  pumpMsg.replace("\"", "\\\"");  // Escape quotes for JSON
-  
-  // Build JSON - EXACT SAME FORMAT as /json endpoint
-  char jsonData[600];
-  snprintf(jsonData, sizeof(jsonData), 
-    "{\"uptime\":%lu,"
-    "\"ETopH\":%.1f,\"ETopL\":%.1f,\"EMidH\":%.1f,\"EMidL\":%.1f,"
-    "\"EBotH\":%.1f,\"EBotL\":%.1f,\"EAv\":%.1f,\"EQtot\":%.2f,"
-    "\"Solar\":%.1f,\"dT\":%.1f,\"dEQ\":%.3f,\"pwmVal\":%d,"
-    "\"Relay\":%d,\"WiFiSig\":%d,\"Mem\":%d,"
-    "\"pump_status\":\"%s\",\"yield_today\":%.1f}",
-    uptime_sec,
-    ETopH, ETopL, EMidH, EMidL, EBotH, EBotL, EAv, EQtot,
-    Tsun, dT, dEQ, pwm_value,
-    pump_relay ? 1 : 0, wifi_rssi, (ESP.getFreeHeap() * 100) / ESP.getHeapSize(),
-    pumpMsg.c_str(), yield_today
-  );
-  
-  // Send HTTP POST
-  HTTPClient http;
-  http.begin(GOOGLE_SCRIPT_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
-  
-  int httpCode = http.POST(jsonData);
-  
-  // Handle response
-  if (httpCode == 302 || httpCode == 200) {
-    logInfo("GSheet OK");
-  } else if (httpCode > 0) {
-    char msg[50];
-    snprintf(msg, 50, "GSheet HTTP %d", httpCode);
-    logWarn(msg);
-  } else {
-    logError("GSheet timeout");
-  }
-  
-  http.end();
-}
-
-
-// =============================================================================
-// HVAC DOORSTUURDER — pollt 192.168.0.70/json en POST naar HVAC Sheets
-// Geen parsing: JSON string wordt rechtstreeks doorgesluisd als payload
-// =============================================================================
-void logHVACToSheets() {
-  if (!WiFi.isConnected()) return;
-  if (millis() - last_hvac_sheets_log < HVAC_SHEETS_INTERVAL) return;
-  last_hvac_sheets_log = millis();
-
-  // Stap 1: Haal HVAC JSON op via plain HTTP
-  HTTPClient httpGet;
-  httpGet.begin(HVAC_JSON_URL);
-  httpGet.setTimeout(5000);
-  int getCode = httpGet.GET();
-
-  if (getCode != 200) {
-    Serial.printf("[HVAC→Sheets] GET mislukt: %d\n", getCode);
-    httpGet.end();
-    return;
-  }
-
-  String payload = httpGet.getString();
-  httpGet.end();
-  Serial.printf("[HVAC→Sheets] GET OK (%d bytes)\n", payload.length());
-
-  // Stap 2: POST payload rechtstreeks door naar Google Sheets
-  HTTPClient httpPost;
-  httpPost.begin(HVAC_SHEETS_URL);
-  httpPost.addHeader("Content-Type", "application/json");
-  httpPost.setTimeout(10000);
-
-  int postCode = httpPost.POST(payload);
-
-  if (postCode == 302 || postCode == 200) {
-    Serial.println("[HVAC→Sheets] POST OK ✓");
-  } else {
-    Serial.printf("[HVAC→Sheets] POST fout: %d\n", postCode);
-  }
-  httpPost.end();
 }
 
 
@@ -911,10 +803,6 @@ void loop() {
     last_mem_check = millis();
   }
   
-    // Google Sheets logging (every 5 minutes)
-    logToGoogleSheets();
-    logHVACToSheets();
-
   // ── Matter override timeout + periodieke sensor update ───────────────────
   check_pump_override();
   if (!ap_mode && millis() - last_matter_update > 5000) {
