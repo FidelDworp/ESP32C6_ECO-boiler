@@ -1099,9 +1099,15 @@ void streamMainPage(AsyncWebServerRequest* request) {
   const char* lb_color = lb >= 35000 ? "#0a0" : lb >= 25000 ? "#f80" : "#c00";
   const char* lb_label = lb >= 35000 ? "OK"   : lb >= 25000 ? "LAAG" : "KRITIEK";
 
-  // Tsun balk: breedte = Tsun/120*100%, begrensd 0-100
-  int tsun_pct = (int)constrain(Tsun / 120.0f * 100.0f, 0.0f, 100.0f);
+  // Tsun balk: bereik -20..120°C (140° span), enkelvoudige kleur blauw->rood
+  int tsun_pct = (int)constrain((Tsun + 20.0f) / 140.0f * 100.0f, 0.0f, 100.0f);
   bool tsun_overheat = (Tsun >= TSUN_OVERHEAT);
+  // Kleur: lineaire interpolatie #0000cc (koud) -> #cc0000 (heet)
+  float tsun_ratio = constrain((Tsun + 20.0f) / 140.0f, 0.0f, 1.0f);
+  int tsun_r = (int)(tsun_ratio * 204.0f);
+  int tsun_b = (int)((1.0f - tsun_ratio) * 204.0f);
+  char tsun_color[8];
+  snprintf(tsun_color, sizeof(tsun_color), "#%02x00%02x", tsun_r, tsun_b);
 
   // EQtot balk
   int eq_pct = (int)constrain(EQtot / EQ_MAX_KWH * 100.0f, 0.0f, 100.0f);
@@ -1133,7 +1139,6 @@ void streamMainPage(AsyncWebServerRequest* request) {
     ".bar-fill{height:100%;border-radius:4px;transition:width .5s;}"
     ".bar-label{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:bold;font-size:14px;color:#000;pointer-events:none;}"
     ".bar-mini{height:7px;border-radius:3px;margin-top:3px;}"
-    ".bar-sun{background:linear-gradient(90deg,#0af 0%,#0f8 25%,#0a0 40%,#fa0 60%,#f60 75%,#c00 100%);}"
     ".overheat{animation:blink 0.7s infinite;border:2px solid #c00;}"
     "@keyframes blink{0%,100%{opacity:1;}50%{opacity:.4;}}"
     ".pump-badge{display:inline-block;padding:6px 14px;border-radius:6px;font-weight:bold;}"
@@ -1171,9 +1176,11 @@ void streamMainPage(AsyncWebServerRequest* request) {
   p->print(tTsun);
   p->print(F("</div><div class='bar-wrap"));
   if (tsun_overheat) p->print(F(" overheat"));
-  p->print(F("'><div class='bar-fill bar-sun' style='width:"));
+  p->print(F("'><div class='bar-fill' style='width:"));
   p->print(tsun_pct);
-  p->print(F("%;'></div><div class='bar-label'>"));
+  p->print(F("%;background:"));
+  p->print(tsun_color);
+  p->print(F(";'></div><div class='bar-label'>"));
   p->print(Tsun, 1);
   p->print(F(" &deg;C</div></div>"));
 
