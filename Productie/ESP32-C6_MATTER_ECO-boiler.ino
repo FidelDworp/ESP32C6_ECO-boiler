@@ -12,6 +12,11 @@
    Board: ESP32C6 Dev Module | Flash: 16MB | Partition: Custom partitions_16mb.csv
    Libraries: ESPAsyncWebServer, Adafruit_MAX31865, OneWireNg, arduino-esp32-Matter
 
+   Version 1.23 (22 mar 2026)
+     RTD sensor type instelbaar via /settings: PT100 (testbord) / PT1000 (dakcollector)
+     readPT1000() gebruikt Adafruit library pt1000.temperature() — correcte Callendar-Van Dusen berekening
+     pt1000.begin() was al MAX31865_2WIRE (2-wire gestandaardiseerd)
+     "PT1000" hernoemd naar "PT-sensor" in UI en commentaar
    Version 1.22 (13 mar 2026)
      #define Serial Serial0 (verplicht ESP32-C6 fix)
      MDNS.begin() verwijderd (conflicteert met Matter interne mDNS-stack)
@@ -148,8 +153,9 @@ const unsigned long PUMP_CHECK_INTERVAL  = 60000;
 const unsigned long DEQ_INTERVAL         = 600000;
 const unsigned long HVAC_PUBLISH_INTERVAL= 300000;
 
-const float RREF    = 4000.0;
-const float RNOMINAL= 1000.0;
+float RREF    = 430.0;   // PT100 default — wordt overschreven door NVS rtd_type
+float RNOMINAL= 100.0;   // PT100 default — wordt overschreven door NVS rtd_type
+bool  rtd_pt1000 = false; // false = PT100 (testbord), true = PT1000 (dakcollector)
 
 int   HOUR_START = 7;
 int   HOUR_END   = 21;
@@ -281,6 +287,7 @@ struct GraphData {
 #define NVS_SENSOR_NICK_BASE "sensor_"
 #define NVS_SIMULATION_MODE  "sim_mode"
 #define NVS_EQ_MAX_KWH   "eq_max_kwh"
+#define NVS_RTD_TYPE     "rtd_type"    // false=PT100 (testbord), true=PT1000 (dakcollector)
 
 // ============== FUNCTION DECLARATIONS ==============
 void loadConfig();
@@ -697,6 +704,9 @@ void loadConfig() {
   config.boiler_volume   = BOILER_VOLUME_TOTAL;
   SIMULATION_MODE        = preferences.getBool(NVS_SIMULATION_MODE, false);
   EQ_MAX_KWH             = preferences.getFloat(NVS_EQ_MAX_KWH, 25.0f);
+  rtd_pt1000             = preferences.getBool(NVS_RTD_TYPE, false);
+  RREF                   = rtd_pt1000 ? 4000.0 : 430.0;
+  RNOMINAL               = rtd_pt1000 ? 1000.0 : 100.0;
   preferences.end();
   Serial.printf("Config loaded: room=%s wifi=%s hvac=%s sim=%d\n",
     config.room_id,
@@ -739,6 +749,7 @@ void saveConfig() {
   }
   preferences.putBool(NVS_SIMULATION_MODE, SIMULATION_MODE);
   preferences.putFloat(NVS_EQ_MAX_KWH, EQ_MAX_KWH);
+  preferences.putBool(NVS_RTD_TYPE, rtd_pt1000);
   preferences.end();
   Serial.println("Config saved to NVS");
 }
@@ -766,7 +777,8 @@ void setupPump() {
 
 void setupSensors() {
   pt1000.begin(MAX31865_2WIRE);
-  Serial.printf("PT1000 init (SPI CS=%d MOSI=%d MISO=%d SCK=%d)\n",
+  Serial.printf("PT-sensor init (2-wire, %s) SPI CS=%d MOSI=%d MISO=%d SCK=%d\n",
+    rtd_pt1000 ? "PT1000 dakcollector" : "PT100 testbord",
     SPI_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
   Serial.printf("DS18B20 ready (OneWireNg pin=%d, 6 sensoren)\n", ONEWIRE_PIN);
 }
@@ -849,9 +861,7 @@ void setupWiFi() {
 float readPT1000() {
   uint16_t rtd = pt1000.readRTD();
   if (rtd == 0 || rtd > 32768) return -127.0;
-  float ratio = rtd / 32768.0;
-  float resistance = ratio * RREF;
-  float temperature = (resistance - RNOMINAL) / 3.850;
+  float temperature = pt1000.temperature(RNOMINAL, RREF);
   if (temperature < -50 || temperature > 200 || isnan(temperature)) return -127.0;
   return temperature;
 }
@@ -1172,7 +1182,7 @@ void streamMainPage(AsyncWebServerRequest* request) {
   }
 
   // Chunk 3 — COLLECTOR met temperatuurbalk
-  p->print(F("<div class='group-title'>COLLECTOR (Dak) "));
+  p->print(F("<div class='group-title'>COLLECTOR (PT-sensor) "));
   p->print(tTsun);
   p->print(F("</div><div class='bar-wrap"));
   if (tsun_overheat) p->print(F(" overheat"));
@@ -1590,6 +1600,22 @@ void streamSettingsPage(AsyncWebServerRequest* request) {
   if (SIMULATION_MODE) p->print(F(" checked"));
   p->print(F("> Activeer simulatie mode</label>"));
 
+  // PT-sensor type
+  p->print(F("<div class='cgroup'>PT-sensor type (herstart vereist)</div><table>"
+    "<tr><td style='width:35%;'>Collector sensor</td><td>"
+    "<select name='rtd_type' style='width:auto;'>"
+    "<option value='0'"));
+  if (!rtd_pt1000) p->print(F(" selected"));
+  p->print(F(">PT100 (testbord)</option>"
+    "<option value='1'"));
+  if (rtd_pt1000) p->print(F(" selected"));
+  p->print(F(">PT1000 (dakcollector)</option>"
+    "</select></td></tr>"
+    "<tr><td>Huidig actief</td><td><b>"));
+  p->print(rtd_pt1000 ? F("PT1000 &mdash; RREF=4000&Omega; RNOMINAL=1000&Omega;")
+                       : F("PT100 &mdash; RREF=430&Omega; RNOMINAL=100&Omega;"));
+  p->print(F("</b></td></tr></table>"));
+
   // Diagnostics
   p->print(F("<div class='cgroup'>Diagnostics</div>"
     "<div style='margin:8px 0;'>"
@@ -1863,6 +1889,7 @@ void setupWebServer() {
       }
     }
     SIMULATION_MODE = request->hasArg("simulation_mode");
+    rtd_pt1000      = request->hasArg("rtd_type") && request->arg("rtd_type").toInt() == 1;
     saveConfig();
     Serial.println("Settings saved. Rebooting...");
     request->send(200,"text/html",
