@@ -70,7 +70,7 @@ Serieel (115200): `status`, `reset-all`, `t` (sensoren), `p` (pomptest), `w` (Wi
 | i | EQtot (kWh) | p | RSSI (dBm) |
 | j | dEQ (kWh / 10 min) | q, r, s | vrije heap %, grootste blok KB, minimum heap KB |
 
-Gebruikt door: Dashboard (.60 → Google Sheets via `Productie/ECO_GoogleScript.gs`), HVAC (.70) en de RPi-portal.
+Gebruikt door: Dashboard (.60 → Google Sheets via `GoogleScript/ECO_GoogleScript.gs`), HVAC (.70) en de RPi-portal.
 
 ## 6. Apple Home (via de RPi)
 
@@ -97,10 +97,10 @@ Details: Portal Plan §16.13.
 
 ```
 README.md                          dit document
-Productie/
-  ESP32-C6_ECO-boiler/
-    ESP32-C6_ECO-boiler.ino        sketch v2.0
-    partitions.csv
+ESP32-C6_ECO-boiler/               de sketch: deze map openen in de Arduino IDE
+  ESP32-C6_ECO-boiler.ino          sketch v2.0
+  partitions.csv                   partitietabel 16 MB (wordt automatisch gebruikt)
+GoogleScript/
   ECO_GoogleScript.gs              Google Sheets-logger (v2)
 old/
   S-ECO_SOLAR_Photon.cpp           oude Photon-firmware (tot jan 2026)
