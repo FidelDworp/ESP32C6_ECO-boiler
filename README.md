@@ -101,7 +101,8 @@ ESP32-C6_ECO-boiler/               de sketch: deze map openen in de Arduino IDE
   ESP32-C6_ECO-boiler.ino          sketch v2.0
   partitions.csv                   partitietabel 16 MB (wordt automatisch gebruikt)
 bin/
-  ESP32-C6_ECO-boiler_v2.0.ino.bin klaar om te uploaden via `/update`
+  ESP32-C6_ECO-boiler_v2.0.ino.bin klaar om te uploaden via `/update` (gecompileerd door Claude:
+                                   ESP32-core 3.3.12, nieuwste bibliotheken; alleen de laatste versie)
 GoogleScript/
   ECO_GoogleScript.gs              Google Sheets-logger (v2)
 old/
